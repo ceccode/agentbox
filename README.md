@@ -65,18 +65,21 @@ Edit `WATCHED_UNITS` at the top of the file for your machine.
 
 ## Give it to your agent
 
-Add to `AGENTS.md`:
-
-```markdown
-## Machine monitoring
-Run `agentbox --json` for a full system snapshot, or `agentbox --json opencode`
-for token usage. Always use --json and parse it — never read /proc or run
-nvidia-smi by hand. Summarize in plain language and flag anything concerning:
-high sustained CPU, low free RAM, disk over 85%, GPU thermal throttling,
-runaway token consumption.
+```bash
+./scripts/install-agent-skill.sh
 ```
 
-That's the whole integration. No MCP server, no subagent.
+Symlinks `skills/agentbox/` into `~/.claude/skills/agentbox`. **opencode and
+Claude Code both read that path**, so one file serves both — nothing duplicated,
+nothing to keep in sync. Restart your agent and ask it how the box is doing;
+`/skills` lists it. Pass a project directory to scope it there instead.
+
+A skill, not an agent: agentbox isn't a persona to switch into, it's a tool the
+agent you're already talking to should know how to use — loaded on demand
+instead of sitting in context every turn. Details and the `AGENTS.md`
+alternative are in [`scripts/README.md`](scripts/README.md).
+
+No MCP server, no subagent, no daemon.
 
 ## Notes
 
