@@ -99,8 +99,15 @@ No MCP server, no subagent, no daemon.
 python3 -m unittest discover -s tests
 ```
 
-The fixture DB is built from 1.18.18's exact schema, so an opencode upgrade
-that moves the schema fails here instead of quietly reporting garbage.
+Two kinds of drift are caught here rather than in the field:
+
+- The fixture DB is built from 1.18.18's exact schema, so an opencode upgrade
+  that moves the schema fails here instead of quietly reporting garbage.
+- `SKILL.md` promises an agent a specific set of flags and sections, and the
+  agent runs them without checking. `tests/test_docs.py` diffs that promise
+  against `build_parser()` in both directions, so renaming a flag — or adding
+  one and forgetting to document it — fails here instead of handing the agent
+  a command that exits non-zero for no visible reason.
 
 ## License
 

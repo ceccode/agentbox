@@ -861,7 +861,10 @@ SECTION_ALIASES = {
 }
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface. Split out from main() so tests can diff it against
+    the docs — SKILL.md promises agents a specific set of flags and sections,
+    and a rename here would otherwise leave that promise silently false."""
     ap = argparse.ArgumentParser(
         prog="agentbox", description="Status probe for a Linux AI agent box.")
     ap.add_argument("section", nargs="?", default="status",
@@ -874,7 +877,11 @@ def main() -> int:
     ap.add_argument("--no-titles", action="store_true",
                     help="scrub session titles, paths and cmdlines "
                          "(use when publishing or logging)")
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     sections = SECTION_ALIASES[args.section]
 
