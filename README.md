@@ -71,6 +71,9 @@ agentbox --deep disk        # inspect known AI storage directories
 agentbox claude             # Claude Code local usage, when available
 agentbox ollama             # installed and running Ollama models
 agentbox changes             # current repository state, without diff content
+agentbox usage               # token trend and configured daily budgets
+agentbox capacity            # deterministic readiness checks
+agentbox explain             # explanations and suggested actions for warnings
 ```
 
 `--no-titles` remains an alias for `--redact`. Use `--jsonl --watch 5` for a
@@ -123,6 +126,9 @@ No MCP server, no subagent, no daemon.
   best-effort and cost is deliberately not estimated.
 - `ollama` uses `ollama list` and `ollama ps`; `changes` reports only repository
   metadata and numstat, never diff content.
+- `usage` compares today with the observed window and optional daily budgets.
+  `capacity` is deterministic and does not claim that a specific model will fit.
+  `explain` uses static explanations, never an embedded LLM.
 
 ## Tests
 

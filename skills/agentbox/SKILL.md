@@ -39,6 +39,9 @@ Pass one positional section to narrow the snapshot:
 | `claude` | local Claude Code token usage by hashed project |
 | `ollama` | installed and running Ollama models |
 | `changes` | Git working tree metadata without diff content |
+| `usage`, `trends` | token trends and optional provider daily budgets |
+| `capacity` | deterministic RAM, disk and pressure readiness checks |
+| `explain` | static explanations and suggested actions for warnings |
 | `services`, `svc` | systemd running/failed + watchlist + listening TCP ports |
 | `opencode`, `oc`, `tokens` | tokens, cost, sessions, per-model/per-day, todos, live agent processes |
 
@@ -86,6 +89,12 @@ Report in plain language, then flag anything concerning:
   current daemon state. Do not infer VRAM use from model size alone.
 - **Changes** — repository state is metadata only; never request or reconstruct
   diff content when this section is available.
+- **Usage** — compare provider values separately. A budget warning concerns
+  observed tokens, not provider billing or subscription spend.
+- **Capacity** — treat `blocked` as a hard resource constraint and `warning` as
+  contention; it is not a model-fit predictor.
+- **Explain** — relay the static meaning and suggestion, but keep the original
+  warning message as the source of truth.
 - **GPU** — temperatures at or above 85 C deserve attention. Do not claim
   throttling unless the hardware exposes a limit.
 - **Tokens** — compare against the per-day breakdown. `cost_usd` is only the

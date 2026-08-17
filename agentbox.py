@@ -25,6 +25,7 @@ import glob
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -447,6 +448,42 @@ DEEP_STORAGE_ROOTS = (
     ("llama", "~/.cache/llama.cpp"),
     ("docker", "/var/lib/docker"),
 )
+CONFIG_PATH = "~/.config/agentbox/config.json"
+
+
+def load_config() -> tuple[dict, str | None]:
+    path = os.path.expanduser(CONFIG_PATH)
+    if not os.path.exists(path):
+        return {}, None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}, "cannot read config"
+    if not isinstance(value, dict):
+        return {}, "config must contain a JSON object"
+    return value, None
+
+
+def _daily_budget(config: dict, provider: str) -> int | None:
+    usage = config.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get(f"{provider}_daily_tokens")
+    try:
+        value = int(value)
+        return value if value > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _config_number(config: dict, key: str, default: float,
+                   minimum: float = 0) -> float:
+    try:
+        value = float(config.get(key, default))
+        return value if math.isfinite(value) and value >= minimum else default
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def _path_hash(path: str) -> str:
@@ -821,6 +858,7 @@ def collect_claude(days: int = 7, scrub: bool = False) -> dict:
         "available": False, "reason": None, "source": "local_files",
         "version": None, "window_days": days, "projects": [],
         "totals": dict(ZERO_TOKENS, turns=0),
+        "tokens_by_day": {},
         "parse": {"files_seen": 0, "files_failed": 0, "records_ignored": 0,
                   "records_recognized": 0},
         "cost_usd": None,
@@ -877,6 +915,9 @@ def collect_claude(days: int = 7, scrub: bool = False) -> dict:
                         project["last_activity"] = max(
                             project["last_activity"] or 0, timestamp)
                         out["totals"]["turns"] += 1
+                        day = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")
+                        out["tokens_by_day"][day] = (
+                            out["tokens_by_day"].get(day, 0) + usage["input"] + usage["output"])
                     if valid_session:
                         project["sessions"] += 1
             except OSError:
@@ -1199,7 +1240,7 @@ def collect_opencode(days: int = 7, scrub: bool = False,
 # snapshot + rendering
 # --------------------------------------------------------------------------- #
 
-def collect_warnings(snap: dict) -> list[dict]:
+def collect_warnings(snap: dict, config: dict | None = None) -> list[dict]:
     """Derive a small, deterministic health summary from collected data."""
     warnings = []
 
@@ -1213,10 +1254,14 @@ def collect_warnings(snap: dict) -> list[dict]:
     if m := snap.get("memory"):
         if m["total_bytes"] and m["available_bytes"] / m["total_bytes"] <= 0.10:
             add("memory_low", f"only {human_bytes(m['available_bytes'])} RAM available")
+    config = config or {}
+    disk_warning_pct = _config_number(config, "disk_warning_pct", 85, 0)
+    inode_warning_pct = _config_number(config, "inode_warning_pct", 85, 0)
     for disk in snap.get("disk", []):
-        if disk["used_pct"] >= 85:
+        if disk["used_pct"] >= disk_warning_pct:
             add("disk_high", f"{disk['path']} is {disk['used_pct']:.1f}% full")
-        if disk.get("inode_used_pct") is not None and disk["inode_used_pct"] >= 85:
+        if (disk.get("inode_used_pct") is not None and
+                disk["inode_used_pct"] >= inode_warning_pct):
             add("inode_high", f"{disk['path']} inodes are {disk['inode_used_pct']:.1f}% used")
         if disk.get("read_only"):
             add("disk_read_only", f"{disk['path']} is mounted read-only")
@@ -1283,6 +1328,102 @@ def collect_warnings(snap: dict) -> list[dict]:
             elif provider.get("reason"):
                 add(f"{name}_partial", f"{name} data is partial: {provider['reason']}")
     return warnings
+
+
+def collect_usage(snap: dict, config: dict | None = None) -> dict:
+    config = config or {}
+    providers = {}
+    warnings = []
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for name in ("opencode", "claude"):
+        provider = snap.get(name)
+        if not provider:
+            continue
+        available = provider.get("available", False)
+        if not available:
+            providers[name] = {"available": False, "today_tokens": None,
+                               "window_tokens": None, "daily_average": None,
+                               "days": 0, "budget_daily_tokens": _daily_budget(config, name)}
+            continue
+        totals = provider.get("tokens_total", provider.get("totals", {}))
+        by_day = provider.get("tokens_by_day", {})
+        current = by_day.get(today, 0)
+        window_days = provider.get("window_days", 7)
+        total = totals.get("input", 0) + totals.get("output", 0)
+        providers[name] = {
+            "available": provider.get("available", False),
+            "today_tokens": current,
+            "window_tokens": total,
+            "daily_average": round(sum(by_day.values()) / max(1, window_days)),
+            "days": len(by_day),
+            "budget_daily_tokens": _daily_budget(config, name),
+        }
+        budget = providers[name]["budget_daily_tokens"]
+        if budget and current > budget:
+            warnings.append({"code": "token_budget", "message":
+                             f"{name} used {human_count(current)} tokens today "
+                             f"(budget {human_count(budget)})"})
+    return {"providers": providers, "warnings": warnings}
+
+
+def collect_capacity(snap: dict, config: dict | None = None) -> dict:
+    config = config or {}
+    checks = []
+    min_ram = int(_config_number(config, "capacity_min_ram_bytes", 2 * 1024 ** 3, 1))
+    min_disk = int(_config_number(config, "capacity_min_disk_bytes", 10 * 1024 ** 3, 1))
+    memory = snap.get("memory")
+    if memory and memory.get("total_bytes", 0) > 0:
+        checks.append({"name": "ram", "status": "ready" if memory["available_bytes"] >= min_ram
+                       else "blocked", "message": human_bytes(memory["available_bytes"]) + " available"})
+    else:
+        checks.append({"name": "ram", "status": "unknown", "message": "data unavailable"})
+    disk = snap.get("disk", [])
+    if disk and all(item.get("total_bytes", 0) > 0 for item in disk):
+        free = min(item["free_bytes"] for item in disk)
+        checks.append({"name": "disk", "status": "ready" if free >= min_disk
+                       else "blocked", "message": human_bytes(free) + " free"})
+    else:
+        checks.append({"name": "disk", "status": "unknown", "message": "data unavailable"})
+    pressure = snap.get("pressure")
+    io_value = (pressure or {}).get("io") if pressure else None
+    io10 = (io_value or {}).get("full", {}).get("avg10")
+    checks.append({"name": "io", "status": ("unknown" if io10 is None else
+                                               "warning" if io10 >= 10 else "ready"),
+                   "message": ("data unavailable" if io10 is None else
+                               f"{io10:.1f}% I/O full pressure")})
+    status = "blocked" if any(c["status"] == "blocked" for c in checks) else (
+        "warning" if any(c["status"] in ("warning", "unknown") for c in checks) else "ready")
+    return {"status": status, "checks": checks}
+
+
+EXPLANATIONS = {
+    "disk_high": ("A filesystem is close to full.", "Inspect `agentbox --deep disk`."),
+    "inode_high": ("The filesystem may run out of file entries before bytes.",
+                   "Remove caches or directories with many small files."),
+    "disk_deep_partial": ("Some storage roots could not be scanned.",
+                          "Run the deep scan with permissions for those roots."),
+    "cpu_pressure_high": ("Runnable work is waiting for CPU time.",
+                          "Inspect top processes and reduce concurrent work."),
+    "memory_pressure_high": ("Processes are stalled waiting for memory.",
+                              "Stop unused agents or reduce model size."),
+    "io_pressure_high": ("Processes are waiting for storage I/O.",
+                         "Inspect disk activity and large model/cache operations."),
+    "agent_server_exposed": ("An agent server is reachable beyond loopback.",
+                             "Bind it to loopback or restrict access with a firewall."),
+    "token_budget": ("A configured daily token budget was exceeded.",
+                      "Review active sessions and the configured budget."),
+}
+
+
+def collect_explain(warnings: list[dict]) -> list[dict]:
+    result = []
+    for warning in warnings:
+        meaning, action = EXPLANATIONS.get(
+            warning["code"], ("A collector reported a condition requiring attention.",
+                               "Inspect the related section for details."))
+        result.append({"code": warning["code"], "message": warning["message"],
+                       "meaning": meaning, "suggestion": action})
+    return result
 
 
 def redact_snapshot(snap: dict) -> None:
@@ -1354,6 +1495,14 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
              scrub: bool = False, deep: bool = False) -> dict:
     want = sections or {"cpu", "mem", "gpu", "disk", "pressure", "services",
                         "agents", "opencode"}
+    if "capacity" in want:
+        want |= {"cpu", "mem", "disk", "pressure"}
+    if "usage" in want:
+        want |= {"opencode", "claude"}
+    if "explain" in want:
+        want |= {"cpu", "mem", "gpu", "disk", "pressure", "services",
+                 "agents", "opencode", "claude", "ollama"}
+    config, config_error = load_config()
     snap = {
         "hostname": os.uname().nodename,
         "kernel": os.uname().release,
@@ -1390,7 +1539,17 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
         snap["changes"] = collect_changes(scrub=scrub)
     if scrub:
         redact_snapshot(snap)
-    snap["warnings"] = collect_warnings(snap)
+    snap["warnings"] = collect_warnings(snap, config)
+    if config_error:
+        snap["warnings"].append({"code": "config_invalid", "message": config_error})
+    if "usage" in want:
+        usage = collect_usage(snap, config)
+        snap["usage"] = usage
+        snap["warnings"].extend(usage["warnings"])
+    if "capacity" in want:
+        snap["capacity"] = collect_capacity(snap, config)
+    if "explain" in want:
+        snap["explain"] = collect_explain(snap["warnings"])
     snap["status"] = "WARNING" if snap["warnings"] else "OK"
     return snap
 
@@ -1573,52 +1732,51 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
 
         if not oc.get("available"):
             L.append(f"  tokens unavailable: {oc.get('reason')}")
-            return "\n".join(clip(line, width) for line in L)
+        else:
+            t = oc["tokens_total"]
+            input_output = t["input"] + t["output"]
+            L.append(f"  tokens: {human_count(input_output)} input+output "
+                     f"(in {human_count(t['input'])} / out {human_count(t['output'])}"
+                     f" / reason {human_count(t['reasoning'])})")
+            L.append(f"          cache read {human_count(t['cache_read'])}, "
+                     f"write {human_count(t['cache_write'])}   "
+                     f"{t['turns']} turns"
+                     + (f"   ${oc['cost_usd']:.2f}" if oc["cost_usd"] else "   $0 reported"))
 
-        t = oc["tokens_total"]
-        input_output = t["input"] + t["output"]
-        L.append(f"  tokens: {human_count(input_output)} input+output "
-                 f"(in {human_count(t['input'])} / out {human_count(t['output'])}"
-                 f" / reason {human_count(t['reasoning'])})")
-        L.append(f"          cache read {human_count(t['cache_read'])}, "
-                 f"write {human_count(t['cache_write'])}   "
-                 f"{t['turns']} turns"
-                 + (f"   ${oc['cost_usd']:.2f}" if oc["cost_usd"] else "   $0 reported"))
+            if oc["tokens_by_model"]:
+                for label, tk in sorted(oc["tokens_by_model"].items(),
+                                        key=lambda kv: -(kv[1]["input"] + kv[1]["output"])):
+                    L.append(f"    {label:<34} {human_count(tk['input'] + tk['output']):>9}"
+                             f"   {tk['turns']} turns")
 
-        if oc["tokens_by_model"]:
-            for label, tk in sorted(oc["tokens_by_model"].items(),
-                                    key=lambda kv: -(kv[1]["input"] + kv[1]["output"])):
-                L.append(f"    {label:<34} {human_count(tk['input'] + tk['output']):>9}"
-                         f"   {tk['turns']} turns")
+            if oc["tokens_by_day"]:
+                L.append("  by day:")
+                peak = max(oc["tokens_by_day"].values()) or 1
+                for day, n in oc["tokens_by_day"].items():
+                    L.append(f"    {day}  {bar(100 * n / peak, 24)} {human_count(n):>9}")
 
-        if oc["tokens_by_day"]:
-            L.append("  by day:")
-            peak = max(oc["tokens_by_day"].values()) or 1
-            for day, n in oc["tokens_by_day"].items():
-                L.append(f"    {day}  {bar(100 * n / peak, 24)} {human_count(n):>9}")
+            if oc["sessions"]:
+                shown_sessions = oc["sessions"][:8]
+                L.append(f"  sessions ({oc['session_count']} in window, "
+                         f"showing {len(shown_sessions)}):")
+                for s in shown_sessions:
+                    ago = human_delta(s["age_seconds"]) if s.get("age_seconds") else "?"
+                    tk = s["summed"]["input"] + s["summed"]["output"]
+                    model = (s["model"] or "?").split("/")[-1]
+                    tag = "+" if s["is_subagent"] else " "
+                    name = s["title"] or s["id"] or "(redacted)"
+                    L.append(f"    {ago:>6} ago {human_count(tk):>8} tok  "
+                             f"{tag}{(s['agent'] or '?') + '/' + model:<22} {clip(name, 36)}")
 
-        if oc["sessions"]:
-            shown_sessions = oc["sessions"][:8]
-            L.append(f"  sessions ({oc['session_count']} in window, "
-                     f"showing {len(shown_sessions)}):")
-            for s in shown_sessions:
-                ago = human_delta(s["age_seconds"]) if s.get("age_seconds") else "?"
-                tk = s["summed"]["input"] + s["summed"]["output"]
-                model = (s["model"] or "?").split("/")[-1]
-                tag = "+" if s["is_subagent"] else " "
-                name = s["title"] or s["id"] or "(redacted)"
-                L.append(f"    {ago:>6} ago {human_count(tk):>8} tok  "
-                         f"{tag}{(s['agent'] or '?') + '/' + model:<22} {clip(name, 36)}")
+            if oc["todos"]:
+                L.append("  open todos:")
+                for td in oc["todos"][:6]:
+                    mark = "*" if td["status"] == "in_progress" else "-"
+                    L.append(f"    {mark} {td['content'] or '(hidden)'}")
 
-        if oc["todos"]:
-            L.append("  open todos:")
-            for td in oc["todos"][:6]:
-                mark = "*" if td["status"] == "in_progress" else "-"
-                L.append(f"    {mark} {td['content'] or '(hidden)'}")
-
-        if oc.get("stored_matches_summed") is False:
-            L.append("  note: session.tokens_* holds the last turn, not the "
-                     "lifetime sum; totals above are summed from part rows")
+            if oc.get("stored_matches_summed") is False:
+                L.append("  note: session.tokens_* holds the last turn, not the "
+                         "lifetime sum; totals above are summed from part rows")
 
     if claude := snap.get("claude"):
         L.append("")
@@ -1660,6 +1818,30 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
             if changes.get("head"):
                 L.append(f"  HEAD {changes['head']['sha'][:12]}  {changes['head']['subject'] or '(redacted)'}")
 
+    if usage := snap.get("usage"):
+        L.append("")
+        L.append("USAGE TRENDS")
+        for name, values in usage["providers"].items():
+            budget = (f" / {human_count(values['budget_daily_tokens'])} budget"
+                      if values.get("budget_daily_tokens") else "")
+            today = (human_count(values["today_tokens"])
+                     if values["today_tokens"] is not None else "unknown")
+            average = (human_count(values["daily_average"])
+                       if values["daily_average"] is not None else "unknown")
+            L.append(f"  {name:<9} today {today:>8}  avg {average:>8}{budget}")
+
+    if capacity := snap.get("capacity"):
+        L.append("")
+        L.append(f"CAPACITY  {capacity['status'].upper()}")
+        for check in capacity["checks"]:
+            L.append(f"  {check['name']:<8} {check['status']:<7} {check['message']}")
+
+    if explain := snap.get("explain"):
+        L.append("")
+        L.append("EXPLAIN")
+        for item in explain:
+            L.append(f"  {item['code']}: {item['meaning']} {item['suggestion']}")
+
     return "\n".join(clip(line, width) for line in L)
 
 
@@ -1673,6 +1855,9 @@ SECTION_ALIASES = {
     "agents": {"agents"},
     "claude": {"claude"}, "ollama": {"ollama"},
     "changes": {"changes"},
+    "usage": {"usage", "opencode", "claude"}, "trends": {"usage", "opencode", "claude"},
+    "capacity": {"capacity", "cpu", "mem", "disk", "pressure"},
+    "explain": {"explain"},
     "services": {"services"}, "svc": {"services"},
     "opencode": {"opencode"}, "oc": {"opencode"}, "tokens": {"opencode"},
 }

@@ -440,6 +440,67 @@ class TestReleaseTwoCollectors(unittest.TestCase):
         self.assertNotIn("secret.py", json.dumps(out))
 
 
+class TestReleaseThreeCollectors(unittest.TestCase):
+    def test_usage_trend_and_budget(self):
+        snap = {
+            "claude": {"available": True, "window_days": 7,
+                       "totals": {"input": 10, "output": 5},
+                       "tokens_by_day": {"2026-08-17": 15}},
+        }
+        usage = agentbox.collect_usage(snap, {"usage": {"claude_daily_tokens": 10}})
+        self.assertEqual(usage["providers"]["claude"]["today_tokens"], 15)
+        self.assertEqual(usage["warnings"][0]["code"], "token_budget")
+
+    def test_capacity_and_explain_are_deterministic(self):
+        snap = {
+            "memory": {"available_bytes": 1, "total_bytes": 2},
+            "disk": [{"free_bytes": 1}],
+            "pressure": {"io": {"full": {"avg10": 20}}},
+        }
+        capacity = agentbox.collect_capacity(snap, {
+            "capacity_min_ram_bytes": 2, "capacity_min_disk_bytes": 2,
+        })
+        self.assertEqual(capacity["status"], "blocked")
+        explain = agentbox.collect_explain([{"code": "disk_high", "message": "full"}])
+        self.assertIn("Inspect", explain[0]["suggestion"])
+
+    def test_capacity_unknown_data_is_not_ready(self):
+        capacity = agentbox.collect_capacity({"pressure": {"available": False}})
+        self.assertEqual(capacity["status"], "warning")
+        self.assertTrue(all(c["status"] == "unknown" for c in capacity["checks"]))
+
+    def test_invalid_capacity_config_does_not_crash(self):
+        capacity = agentbox.collect_capacity({}, {"capacity_min_ram_bytes": "oops"})
+        self.assertEqual(capacity["status"], "warning")
+        capacity = agentbox.collect_capacity({}, {"capacity_min_ram_bytes": "Infinity"})
+        self.assertEqual(capacity["status"], "warning")
+
+    def test_capacity_zero_collectors_are_unknown(self):
+        capacity = agentbox.collect_capacity({
+            "memory": {"total_bytes": 0, "available_bytes": 0},
+            "disk": [{"total_bytes": 0, "free_bytes": 0}],
+            "pressure": {"io": {"full": {"avg10": 0}}},
+        })
+        self.assertEqual(capacity["status"], "warning")
+        self.assertEqual([c["status"] for c in capacity["checks"]], ["unknown", "unknown", "ready"])
+
+    def test_unavailable_usage_is_explicit(self):
+        usage = agentbox.collect_usage({
+            "opencode": {"available": False},
+        })
+        self.assertIsNone(usage["providers"]["opencode"]["today_tokens"])
+
+    def test_invalid_config_is_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("not json")
+            with mock.patch.object(agentbox.os.path, "expanduser", return_value=path):
+                config, error = agentbox.load_config()
+        self.assertEqual(config, {})
+        self.assertIn("cannot read config", error)
+
+
 class TestStatusAndRendering(unittest.TestCase):
     def test_warning_summary(self):
         snap = {
