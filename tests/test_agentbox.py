@@ -7,11 +7,13 @@ the schema fails these instead of silently reporting wrong token counts.
 """
 
 import json
+import io
 import os
 import sqlite3
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import agentbox  # noqa: E402
@@ -118,6 +120,13 @@ class TestFormatters(unittest.TestCase):
         self.assertEqual(agentbox.bar(-10, 4), "[....]")
         self.assertEqual(agentbox.bar(999, 4), "[####]")
 
+    def test_command_output_replaces_invalid_utf8(self):
+        output, error = agentbox.run_result([
+            sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'\\xff')"
+        ])
+        self.assertEqual(output, "\ufffd")
+        self.assertIsNone(error)
+
 
 class TestModelLabel(unittest.TestCase):
     def test_bare_session_model_object(self):
@@ -148,6 +157,178 @@ class TestPartTokens(unittest.TestCase):
 
     def test_missing_tokens(self):
         self.assertIsNone(agentbox._part_tokens({"type": "text"}))
+
+    def test_malformed_tokens(self):
+        self.assertIsNone(agentbox._part_tokens({"tokens": {"input": "nope"}}))
+
+
+class TestCLI(unittest.TestCase):
+    def test_positive_numeric_options(self):
+        args = agentbox.build_parser().parse_args(["--days", "1", "--watch", "2"])
+        self.assertEqual((args.days, args.watch), (1, 2))
+
+    def test_rejects_non_positive_numeric_options(self):
+        for argv in (["--days", "0"], ["--days", "-1"],
+                     ["--watch", "0"], ["--watch", "-1"]):
+            with self.subTest(argv=argv), mock.patch.object(sys, "stderr", io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                agentbox.build_parser().parse_args(argv)
+
+    def test_redact_aliases(self):
+        for flag in ("--redact", "--no-titles"):
+            with self.subTest(flag=flag):
+                self.assertTrue(agentbox.build_parser().parse_args([flag]).redact)
+
+    def test_jsonl_is_one_parseable_line(self):
+        snap = {"hostname": "box", "timestamp": "now", "status": "OK", "warnings": []}
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", ["agentbox", "--jsonl", "cpu"]), \
+                mock.patch.object(agentbox, "snapshot", return_value=snap), \
+                mock.patch.object(sys, "stdout", stdout):
+            self.assertEqual(agentbox.main(), 0)
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0]), snap)
+
+    def test_watch_non_tty_has_no_ansi(self):
+        long_message = "x" * 200
+        snap = {"hostname": "box", "timestamp": "now", "status": "WARNING",
+                "warnings": [{"code": "test", "message": long_message}]}
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", ["agentbox", "--watch", "1", "cpu"]), \
+                mock.patch.object(agentbox, "snapshot", return_value=snap), \
+                mock.patch.object(agentbox.time, "sleep", side_effect=KeyboardInterrupt), \
+                mock.patch.object(sys, "stdout", stdout):
+            self.assertEqual(agentbox.main(), 0)
+        self.assertNotIn("\x1b", stdout.getvalue())
+        self.assertIn(long_message, stdout.getvalue())
+
+    def test_formatted_json_watch_is_rejected(self):
+        with mock.patch.object(sys, "argv", ["agentbox", "--json", "--watch", "1"]), \
+                mock.patch.object(sys, "stderr", io.StringIO()), \
+                self.assertRaises(SystemExit):
+            agentbox.main()
+
+    def test_closed_pipe_exits_cleanly(self):
+        class ClosedPipe(io.StringIO):
+            def write(self, value):
+                raise BrokenPipeError
+
+            def close(self):
+                pass
+
+        stdout = ClosedPipe()
+        snap = {"hostname": "box", "timestamp": "now", "status": "OK", "warnings": []}
+        with mock.patch.object(sys, "argv", ["agentbox", "--jsonl", "cpu"]), \
+                mock.patch.object(agentbox, "snapshot", return_value=snap), \
+                mock.patch.object(sys, "stdout", stdout):
+            self.assertEqual(agentbox.main(), 0)
+
+
+class TestStatusAndRendering(unittest.TestCase):
+    def test_warning_summary(self):
+        snap = {
+            "disk": [{"path": "/", "used_pct": 91.0}],
+            "memory": {"total_bytes": 100, "available_bytes": 5},
+        }
+        warnings = agentbox.collect_warnings(snap)
+        self.assertEqual({w["code"] for w in warnings}, {"disk_high", "memory_low"})
+
+    def test_redact_removes_identifiers(self):
+        snap = {
+            "hostname": "private-host",
+            "cpu": {"top": [{"pid": 123, "name": "python", "cmdline": "/secret/x"}]},
+            "listening": [{"address": "10.0.0.1:8080", "port": "8080",
+                           "process": "server(123)"}],
+            "gpu": {"processes": [{"pid": 456, "name": "secret-worker"}]},
+            "opencode": {
+                "db_path": "/home/user/opencode.db",
+                "live_processes": [{"pid": 123, "tty": "pts/1", "cmdline": "/secret"}],
+                "sessions": [{"id": "ses_secret", "parent_id": "ses_parent",
+                              "title": "secret title", "directory": "/secret/project"}],
+                "todos": [{"session_id": "ses_secret", "content": "secret todo"}],
+            },
+        }
+        agentbox.redact_snapshot(snap)
+        blob = json.dumps(snap)
+        for secret in ("private-host", "10.0.0.1", "ses_secret", "ses_parent",
+                       "/home/user", "pts/1", "/secret", "secret title", "secret todo",
+                       "secret-worker", "server(123)", "python"):
+            self.assertNotIn(secret, blob)
+        self.assertEqual(snap["listening"][0]["address"], "*:8080")
+
+    def test_listener_ownership_warning(self):
+        snap = {"services": {
+            "available": True, "failed": [], "watched": [],
+            "listeners_available": True, "listener_owners_available": False,
+        }}
+        self.assertEqual(agentbox.collect_warnings(snap)[0]["code"],
+                         "listener_owners_unavailable")
+
+    def test_unavailable_reason_is_clipped(self):
+        snap = {
+            "hostname": "box", "timestamp": "now", "status": "WARNING", "warnings": [],
+            "opencode": {"window_days": 7, "version": None, "tested_version": "1",
+                         "live_processes": [], "available": False, "reason": "x" * 200},
+        }
+        self.assertTrue(all(len(line) <= 40 for line in agentbox.render(snap, width=40).splitlines()))
+
+    def test_clip_handles_tiny_widths(self):
+        self.assertEqual([agentbox.clip("long", width) for width in range(4)],
+                         ["", ".", "..", "..."])
+
+    def test_plain_gpu_output_is_ascii(self):
+        snap = {
+            "hostname": "box", "timestamp": "now", "status": "OK", "warnings": [],
+            "gpu": {"available": True, "gpus": [{
+                "index": 0, "name": "gpu", "util_pct": 1, "mem_used_bytes": 1,
+                "mem_total_bytes": 2, "temp_c": 40, "power_w": None,
+                "power_limit_w": None,
+            }], "processes": [{"name": "worker", "pid": 1, "mem_bytes": 1}]},
+        }
+        self.assertTrue(agentbox.render(snap, plain=True).isascii())
+
+    def test_session_count_matches_rendered_rows(self):
+        sessions = [{
+            "age_seconds": n + 1, "summed": {"input": 1, "output": 1},
+            "model": "provider/model", "is_subagent": False, "agent": "build",
+            "title": f"session-{n}", "id": f"ses_{n}",
+        } for n in range(10)]
+        snap = {
+            "hostname": "box", "timestamp": "now", "status": "OK", "warnings": [],
+            "opencode": {
+                "window_days": 7, "version": None, "tested_version": "1",
+                "live_processes": [], "available": True,
+                "tokens_total": dict(agentbox.ZERO_TOKENS, turns=0), "cost_usd": 0,
+                "tokens_by_model": {}, "tokens_by_day": {}, "sessions": sessions,
+                "session_count": 10, "todos": [], "stored_matches_summed": None,
+            },
+        }
+        text = agentbox.render(snap)
+        self.assertIn("showing 8", text)
+        self.assertIn("session-7", text)
+        self.assertNotIn("session-8", text)
+
+    def test_collect_services_keeps_full_watchlist(self):
+        def fake_result(cmd, timeout=5):
+            if "--state=running" in cmd:
+                return "ssh.service loaded active running SSH\n", None
+            return "", None
+
+        def fake_run(cmd, timeout=5):
+            unit = cmd[-1]
+            if unit == "ssh" and "--user" not in cmd:
+                return "active\n"
+            if unit == "ollama" and "--user" in cmd:
+                return "active\n"
+            return "inactive\n"
+
+        with mock.patch.object(agentbox, "run_result", side_effect=fake_result), \
+                mock.patch.object(agentbox, "run", side_effect=fake_run):
+            services = agentbox.collect_services()
+        self.assertEqual([w["unit"] for w in services["watched"]], agentbox.WATCHED_UNITS)
+        ollama = next(w for w in services["watched"] if w["unit"] == "ollama")
+        self.assertEqual((ollama["state"], ollama["scope"]), ("active", "user"))
 
 
 class TestCollector(unittest.TestCase):

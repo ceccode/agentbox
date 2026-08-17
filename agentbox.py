@@ -81,15 +81,26 @@ def bar(pct: float, width: int = 20) -> str:
 
 def run(cmd: list[str], timeout: int = 5) -> str:
     """Run a command, return stdout or '' on any failure. Never raises."""
+    return run_result(cmd, timeout)[0]
+
+
+def run_result(cmd: list[str], timeout: int = 5) -> tuple[str, str | None]:
+    """Run a command and preserve why its output may be unavailable."""
     if not shutil.which(cmd[0]):
-        return ""
+        return "", f"{cmd[0]} not found"
     try:
         out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd, capture_output=True, text=True, errors="replace",
+            timeout=timeout, check=False
         )
-        return out.stdout
-    except Exception:
-        return ""
+        if out.returncode:
+            reason = out.stderr.strip() or f"{cmd[0]} exited {out.returncode}"
+            return out.stdout, reason
+        return out.stdout, None
+    except subprocess.TimeoutExpired:
+        return "", f"{cmd[0]} timed out after {timeout}s"
+    except OSError as exc:
+        return "", f"{cmd[0]} failed: {exc}"
 
 
 def read(path: str) -> str:
@@ -221,7 +232,8 @@ def collect_gpu() -> dict:
     # --- NVIDIA ---
     q = ("name,utilization.gpu,memory.used,memory.total,temperature.gpu,"
          "power.draw,power.limit")
-    out = run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"])
+    out, nvidia_error = run_result(
+        ["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"])
     if out.strip():
         vendor = "nvidia"
         for idx, line in enumerate(out.strip().splitlines()):
@@ -252,7 +264,8 @@ def collect_gpu() -> dict:
                     "name": os.path.basename(f[1]),
                     "mem_bytes": (float(f[2]) if f[2].replace(".", "").isdigit() else 0) * 1024 ** 2,
                 })
-        return {"vendor": vendor, "gpus": gpus, "processes": apps}
+        return {"available": True, "reason": None, "vendor": vendor,
+                "gpus": gpus, "processes": apps}
 
     # --- AMD (amdgpu sysfs) ---
     for card in sorted(glob.glob("/sys/class/drm/card*/device/gpu_busy_percent")):
@@ -274,7 +287,9 @@ def collect_gpu() -> dict:
             "temp_c": temp, "power_w": None, "power_limit_w": None,
         })
 
-    return {"vendor": vendor, "gpus": gpus, "processes": []}
+    available = bool(gpus) or nvidia_error == "nvidia-smi not found"
+    return {"available": available, "reason": None if available else nvidia_error,
+            "vendor": vendor, "gpus": gpus, "processes": []}
 
 
 def collect_disk(paths=("/", "/home")) -> list[dict]:
@@ -303,8 +318,9 @@ def collect_disk(paths=("/", "/home")) -> list[dict]:
 def collect_services() -> dict:
     """Running systemd units + explicit status for the ones we care about."""
     running = []
-    out = run(["systemctl", "list-units", "--type=service", "--state=running",
-               "--no-legend", "--no-pager", "--plain"])
+    out, list_error = run_result(
+        ["systemctl", "list-units", "--type=service", "--state=running",
+         "--no-legend", "--no-pager", "--plain"])
     for line in out.splitlines():
         parts = line.split(None, 4)
         if parts and parts[0].endswith(".service"):
@@ -315,28 +331,40 @@ def collect_services() -> dict:
 
     watched = []
     for unit in WATCHED_UNITS:
-        state = run(["systemctl", "is-active", unit]).strip()
-        if not state or state == "inactive":
-            # also check the user bus (opencode/ollama are often user units)
-            state = run(["systemctl", "--user", "is-active", unit]).strip() or state
-        if state and state != "inactive":
-            watched.append({"unit": unit, "state": state})
+        system_state = run(["systemctl", "is-active", unit]).strip() or "unknown"
+        user_state = "unknown"
+        if system_state != "active":
+            user_state = run(["systemctl", "--user", "is-active", unit]).strip() or "unknown"
+        if system_state == "active":
+            state, scope = system_state, "system"
+        elif user_state == "active":
+            state, scope = user_state, "user"
+        else:
+            states = (system_state, user_state)
+            state = next((s for s in ("failed", "activating", "deactivating", "inactive")
+                          if s in states), "unknown")
+            scope = ("system" if state == system_state and state != "unknown"
+                     else "user" if state == user_state and state != "unknown" else None)
+        watched.append({"unit": unit, "state": state, "scope": scope})
 
     failed = []
-    fout = run(["systemctl", "list-units", "--state=failed", "--no-legend",
-                "--no-pager", "--plain"])
+    fout, failed_error = run_result(
+        ["systemctl", "list-units", "--type=service", "--state=failed", "--no-legend",
+         "--no-pager", "--plain"])
     for line in fout.splitlines():
         parts = line.split(None, 1)
         if parts:
             failed.append(parts[0])
 
-    return {"running_count": len(running), "running": running,
+    errors = [e for e in (list_error, failed_error) if e]
+    return {"available": not errors, "reason": "; ".join(errors) or None,
+            "running_count": len(running), "running": running,
             "watched": watched, "failed": failed}
 
 
-def collect_listeners() -> list[dict]:
+def collect_listeners() -> tuple[list[dict], str | None]:
     """Listening TCP sockets with owning process - shows agent servers."""
-    out = run(["ss", "-ltnpH"])
+    out, error = run_result(["ss", "-ltnpH"])
     res = []
     for line in out.splitlines():
         cols = line.split()
@@ -349,7 +377,7 @@ def collect_listeners() -> list[dict]:
             proc = f"{m.group(1)}({m.group(2)})"
         port = addr.rsplit(":", 1)[-1]
         res.append({"address": addr, "port": port, "process": proc})
-    return res
+    return res, error
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +386,14 @@ def collect_listeners() -> list[dict]:
 
 TESTED_OPENCODE_VERSION = "1.18.18"
 REQUIRED_TABLES = {"session", "message", "part"}
+REQUIRED_COLUMNS = {
+    "session": {"id", "parent_id", "title", "directory", "agent", "model",
+                "cost", "tokens_input", "tokens_output", "tokens_reasoning",
+                "tokens_cache_read", "tokens_cache_write", "time_created",
+                "time_updated", "time_archived", "version"},
+    "message": {"id", "data"},
+    "part": {"message_id", "session_id", "time_created", "data"},
+}
 ZERO_TOKENS = {"input": 0, "output": 0, "reasoning": 0,
                "cache_read": 0, "cache_write": 0}
 
@@ -421,13 +457,16 @@ def _part_tokens(data: dict) -> dict | None:
     if not isinstance(t, dict):
         return None
     cache = t.get("cache") if isinstance(t.get("cache"), dict) else {}
-    return {
-        "input": int(t.get("input") or 0),
-        "output": int(t.get("output") or 0),
-        "reasoning": int(t.get("reasoning") or 0),
-        "cache_read": int(cache.get("read") or 0),
-        "cache_write": int(cache.get("write") or 0),
-    }
+    try:
+        return {
+            "input": int(t.get("input") or 0),
+            "output": int(t.get("output") or 0),
+            "reasoning": int(t.get("reasoning") or 0),
+            "cache_read": int(cache.get("read") or 0),
+            "cache_write": int(cache.get("write") or 0),
+        }
+    except (TypeError, ValueError):
+        return None
 
 
 def _add(dst: dict, src: dict) -> None:
@@ -534,7 +573,7 @@ def collect_opencode(days: int = 7, scrub: bool = False) -> dict:
     if not path:
         out["reason"] = "opencode database not found (set AGENTBOX_OPENCODE_DB)"
         return out
-    out["db_path"] = os.path.basename(path) if scrub else path
+    out["db_path"] = None if scrub else path
 
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3.0)
@@ -551,6 +590,15 @@ def collect_opencode(days: int = 7, scrub: bool = False) -> dict:
             out["reason"] = (f"schema mismatch: missing {sorted(missing)} "
                              f"(tested against opencode {TESTED_OPENCODE_VERSION})")
             return out
+
+        for table, required in REQUIRED_COLUMNS.items():
+            columns = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+            missing_columns = required - columns
+            if missing_columns:
+                out["reason"] = (f"schema mismatch: {table} missing "
+                                 f"{sorted(missing_columns)} (tested against "
+                                 f"opencode {TESTED_OPENCODE_VERSION})")
+                return out
 
         cutoff_ms = int((time.time() - days * 86400) * 1000)
 
@@ -613,7 +661,10 @@ def collect_opencode(days: int = 7, scrub: bool = False) -> dict:
             label = (_model_label(_jload(r["mdata"]),
                                   {"model": sess["model"]} if sess else None)
                      or (sess or {}).get("model") or "unknown")
-            cost = float(pdata.get("cost") or 0)
+            try:
+                cost = float(pdata.get("cost") or 0)
+            except (TypeError, ValueError):
+                cost = 0.0
 
             _add(out["tokens_total"], tok)
             out["tokens_total"]["turns"] += 1
@@ -622,7 +673,8 @@ def collect_opencode(days: int = 7, scrub: bool = False) -> dict:
             _add(by_model[label], tok)
             by_model[label]["turns"] += 1
 
-            day = datetime.fromtimestamp((r["ts"] or 0) / 1000).strftime("%Y-%m-%d")
+            day = datetime.fromtimestamp(
+                (r["ts"] or 0) / 1000, timezone.utc).strftime("%Y-%m-%d")
             by_day[day] += tok["input"] + tok["output"]
 
             if sess:
@@ -677,6 +729,87 @@ def collect_opencode(days: int = 7, scrub: bool = False) -> dict:
 # snapshot + rendering
 # --------------------------------------------------------------------------- #
 
+def collect_warnings(snap: dict) -> list[dict]:
+    """Derive a small, deterministic health summary from collected data."""
+    warnings = []
+
+    def add(code: str, message: str) -> None:
+        warnings.append({"code": code, "message": message})
+
+    if c := snap.get("cpu"):
+        if c["usage_pct"] >= 90 or c["load_per_core"] >= 1.0:
+            add("cpu_high", f"CPU pressure is high ({c['usage_pct']:.1f}%, "
+                f"{c['load_per_core']:.2f}x load per core)")
+    if m := snap.get("memory"):
+        if m["total_bytes"] and m["available_bytes"] / m["total_bytes"] <= 0.10:
+            add("memory_low", f"only {human_bytes(m['available_bytes'])} RAM available")
+    for disk in snap.get("disk", []):
+        if disk["used_pct"] >= 85:
+            add("disk_high", f"{disk['path']} is {disk['used_pct']:.1f}% full")
+
+    if g := snap.get("gpu"):
+        if not g.get("available", True):
+            add("gpu_unavailable", f"GPU data unavailable: {g.get('reason') or 'unknown error'}")
+        for gpu in g.get("gpus", []):
+            if gpu.get("temp_c") is not None and gpu["temp_c"] >= 85:
+                add("gpu_hot", f"GPU {gpu['index']} is {gpu['temp_c']:.0f} C")
+
+    if services := snap.get("services"):
+        if not services.get("available", True):
+            add("services_unavailable",
+                f"service data unavailable: {services.get('reason') or 'unknown error'}")
+        failed = {unit.removesuffix(".service") for unit in services.get("failed", [])}
+        for unit in sorted(failed):
+            add("service_failed", f"{unit} service failed")
+        for watched in services.get("watched", []):
+            if watched["state"] == "failed" and watched["unit"] not in failed:
+                add("watched_service_failed", f"{watched['unit']} service failed")
+        if not services.get("listeners_available", True):
+            add("listeners_unavailable",
+                f"listener data unavailable: {services.get('listeners_reason') or 'unknown error'}")
+        elif not services.get("listener_owners_available", True):
+            add("listener_owners_unavailable",
+                "listener ownership unavailable; run with sufficient permissions")
+
+    if oc := snap.get("opencode"):
+        if not oc.get("available"):
+            add("opencode_unavailable", f"opencode data unavailable: {oc.get('reason')}")
+        elif oc.get("version") and oc["version"] != oc["tested_version"]:
+            add("opencode_version", f"opencode {oc['version']} differs from tested "
+                f"{oc['tested_version']}")
+    return warnings
+
+
+def redact_snapshot(snap: dict) -> None:
+    """Remove host, network and process identifiers in place."""
+    snap["hostname"] = "redacted"
+    for proc in snap.get("cpu", {}).get("top", []):
+        proc["pid"] = None
+        proc["name"] = "(redacted)"
+        proc["cmdline"] = "(redacted)"
+    for listener in snap.get("listening", []):
+        listener["address"] = f"*:{listener['port']}"
+        listener["process"] = "(redacted)" if listener["process"] else ""
+    if gpu := snap.get("gpu"):
+        for proc in gpu.get("processes", []):
+            proc["pid"] = None
+            proc["name"] = "(redacted)"
+    if oc := snap.get("opencode"):
+        oc["db_path"] = None
+        for proc in oc.get("live_processes", []):
+            proc["pid"] = None
+            proc["tty"] = None
+            proc["cmdline"] = None
+        for session in oc.get("sessions", []):
+            session["id"] = None
+            session["parent_id"] = None
+            session["title"] = None
+            session["directory"] = None
+        for todo in oc.get("todos", []):
+            todo["session_id"] = None
+            todo["content"] = None
+
+
 def snapshot(days: int = 7, sections: set[str] | None = None,
              scrub: bool = False) -> dict:
     want = sections or {"cpu", "mem", "gpu", "disk", "services", "opencode"}
@@ -687,9 +820,6 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
     }
     if "cpu" in want or "procs" in want:
         snap["cpu"] = collect_cpu_and_procs()
-        if scrub:
-            for p in snap["cpu"]["top"]:
-                p["cmdline"] = p["name"]
     if "mem" in want:
         snap["memory"] = collect_mem()
     if "gpu" in want:
@@ -698,57 +828,97 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
         snap["disk"] = collect_disk()
     if "services" in want:
         snap["services"] = collect_services()
-        snap["listening"] = collect_listeners()
+        snap["listening"], listener_error = collect_listeners()
+        snap["services"]["listeners_available"] = listener_error is None
+        snap["services"]["listeners_reason"] = listener_error
+        snap["services"]["listener_owners_available"] = (
+            not snap["listening"] or all(item["process"] for item in snap["listening"]))
     if "opencode" in want:
         snap["opencode"] = collect_opencode(days, scrub=scrub)
+    snap["warnings"] = collect_warnings(snap)
+    snap["status"] = "WARNING" if snap["warnings"] else "OK"
+    if scrub:
+        redact_snapshot(snap)
     return snap
 
 
-def render(snap: dict) -> str:
+def clip(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return "." * width
+    return text[:max(0, width - 3)] + "..."
+
+
+def render(snap: dict, width: int = 120, plain: bool = False) -> str:
     L: list[str] = []
-    L.append(f"── {snap['hostname']}  ·  {snap['timestamp']}")
+    compact = width < 100
+    sep = " | " if plain else "  ·  "
+    L.append(f"{'--' if plain else '──'} {snap['hostname']}{sep}{snap['timestamp']}")
+    warnings = snap.get("warnings", [])
+    status = snap.get("status", "WARNING" if warnings else "OK")
+    summary = f"STATUS  {status}"
+    if warnings:
+        summary += sep + sep.join(w["message"] for w in warnings[:2])
+        if len(warnings) > 2:
+            summary += f"{sep}+{len(warnings) - 2} more"
+    L.append(summary)
 
     if c := snap.get("cpu"):
         L.append("")
-        L.append(f"CPU   {bar(c['usage_pct'])} {c['usage_pct']:5.1f}%  "
-                 f"{c['cores']} cores   load {c['load'][0]}/{c['load'][1]}/{c['load'][2]}"
+        meter = "" if compact else f"{bar(c['usage_pct'])} "
+        degree = " C" if plain else "°C"
+        L.append(f"CPU   {meter}{c['usage_pct']:5.1f}%  {c['cores']} cores   "
+                 f"load {c['load'][0]}/{c['load'][1]}/{c['load'][2]}"
                  f" ({c['load_per_core']}x per core)"
-                 + (f"   {c['temp_c']}°C" if c.get("temp_c") else ""))
+                 + (f"   {c['temp_c']}{degree}" if c.get("temp_c") else ""))
         L.append(f"      up {human_delta(c['uptime_seconds'])}")
 
     if m := snap.get("memory"):
-        L.append(f"RAM   {bar(m['used_pct'])} {m['used_pct']:5.1f}%  "
+        meter = "" if compact else f"{bar(m['used_pct'])} "
+        L.append(f"RAM   {meter}{m['used_pct']:5.1f}%  "
                  f"{human_bytes(m['used_bytes'])} / {human_bytes(m['total_bytes'])}"
                  f"   ({human_bytes(m['available_bytes'])} available)")
         if m["swap_total_bytes"]:
-            L.append(f"SWAP  {bar(m['swap_used_pct'])} {m['swap_used_pct']:5.1f}%  "
+            meter = "" if compact else f"{bar(m['swap_used_pct'])} "
+            L.append(f"SWAP  {meter}{m['swap_used_pct']:5.1f}%  "
                      f"{human_bytes(m['swap_used_bytes'])} / {human_bytes(m['swap_total_bytes'])}")
 
     g = snap.get("gpu")
-    if g and g.get("gpus"):
+    if g and not g.get("available", True):
+        L.append(f"GPU   data unavailable: {g.get('reason') or 'unknown error'}")
+    elif g and g.get("gpus"):
         for gpu in g["gpus"]:
             util = gpu.get("util_pct")
             mem_pct = (100 * gpu["mem_used_bytes"] / gpu["mem_total_bytes"]
                        if gpu.get("mem_total_bytes") else 0)
             extra = ""
             if gpu.get("temp_c"):
-                extra += f"   {gpu['temp_c']:.0f}°C"
+                extra += f"   {gpu['temp_c']:.0f}{' C' if plain else '°C'}"
             if gpu.get("power_w"):
                 extra += f"   {gpu['power_w']:.0f}W"
                 if gpu.get("power_limit_w"):
                     extra += f"/{gpu['power_limit_w']:.0f}W"
-            L.append(f"GPU   {bar(util or 0)} {(util or 0):5.1f}%  {gpu['name']}{extra}")
-            L.append(f"VRAM  {bar(mem_pct)} {mem_pct:5.1f}%  "
-                     f"{human_bytes(gpu['mem_used_bytes'])} / "
+            util_text = "unknown" if util is None else f"{util:5.1f}%"
+            meter = "" if compact or util is None else f"{bar(util)} "
+            L.append(f"GPU   {meter}{util_text}  {gpu['name']}{extra}")
+            meter = "" if compact else f"{bar(mem_pct)} "
+            L.append(f"VRAM  {meter}{mem_pct:5.1f}%  "
+                      f"{human_bytes(gpu['mem_used_bytes'])} / "
                      f"{human_bytes(gpu['mem_total_bytes'])}")
         for p in g.get("processes", []):
-            L.append(f"        · {p['name']} (pid {p['pid']}) "
+            bullet = "-" if plain else "·"
+            pid = str(p["pid"]) if p.get("pid") is not None else "-"
+            L.append(f"        {bullet} {p['name']} (pid {pid}) "
                      f"{human_bytes(p['mem_bytes'])} VRAM")
     elif g is not None:
         L.append("GPU   no NVIDIA/AMD GPU detected (Intel iGPU? try intel_gpu_top)")
 
     for d in snap.get("disk", []):
-        L.append(f"DISK  {bar(d['used_pct'])} {d['used_pct']:5.1f}%  {d['path']}  "
+        meter = "" if compact else f"{bar(d['used_pct'])} "
+        L.append(f"DISK  {meter}{d['used_pct']:5.1f}%  {d['path']}  "
                  f"{human_bytes(d['used_bytes'])} / {human_bytes(d['total_bytes'])}"
                  f"   ({human_bytes(d['free_bytes'])} free)")
 
@@ -757,25 +927,35 @@ def render(snap: dict) -> str:
             L.append("")
             L.append("TOP PROCESSES")
             for p in c["top"]:
+                pid = str(p["pid"]) if p.get("pid") is not None else "-"
                 L.append(f"  {p['cpu_pct']:5.1f}%cpu  {human_bytes(p['rss_bytes']):>7} rss  "
-                         f"{p['pid']:>7}  {p['cmdline'][:64]}")
+                         f"{pid:>7}  {p['cmdline'][:64]}")
 
     if s := snap.get("services"):
         L.append("")
-        L.append(f"SERVICES  {s['running_count']} running"
-                 + (f"   ⚠ {len(s['failed'])} FAILED" if s["failed"] else ""))
+        active = sum(w["state"] == "active" for w in s["watched"])
+        failed_mark = "!" if plain else "⚠"
+        L.append(f"SERVICES  {s['running_count']} system running   "
+                 f"watched {active}/{len(s['watched'])} active"
+                 + (f"   {failed_mark} {len(s['failed'])} FAILED" if s["failed"] else ""))
+        if not s.get("available", True):
+            L.append(f"  data unavailable: {s.get('reason') or 'unknown error'}")
         for w in s["watched"]:
-            L.append(f"  ● {w['unit']:<22} {w['state']}")
+            if plain:
+                mark = "+" if w["state"] == "active" else "!" if w["state"] == "failed" else "-"
+            else:
+                mark = "●" if w["state"] == "active" else "○"
+            scope = f" ({w['scope']})" if w.get("scope") else ""
+            L.append(f"  {mark} {w['unit']:<22} {w['state']}{scope}")
         for f in s["failed"]:
-            L.append(f"  ✗ {f}  (failed)")
+            L.append(f"  {'x' if plain else '✗'} {f}  (failed)")
 
     if listeners := snap.get("listening"):
-        interesting = [l for l in listeners if l["process"]]
-        if interesting:
-            L.append("")
-            L.append("LISTENING")
-            for l in interesting[:12]:
-                L.append(f"  {l['address']:<28} {l['process']}")
+        L.append("")
+        L.append("LISTENING")
+        for listener in listeners[:12]:
+            owner = listener["process"] or "(owner unavailable)"
+            L.append(f"  {listener['address']:<28} {owner}")
 
     if oc := snap.get("opencode"):
         L.append("")
@@ -793,25 +973,25 @@ def render(snap: dict) -> str:
             for p in live:
                 age = human_delta(p["age_seconds"]) if p["age_seconds"] else "?"
                 tty = p["tty"] or "-"
-                what = p["cmdline"] or p["kind"]
-                L.append(f"  > {p['kind']:<9} pid {p['pid']:<7} {tty:<9} "
+                pid = str(p["pid"]) if p.get("pid") is not None else "-"
+                L.append(f"  > {p['kind']:<9} pid {pid:<7} {tty:<9} "
                          f"up {age:<7} {human_bytes(p['rss_bytes']):>7} rss")
         else:
             L.append("  no opencode/llama/ollama process running")
 
         if not oc.get("available"):
             L.append(f"  tokens unavailable: {oc.get('reason')}")
-            return "\n".join(L)
+            return "\n".join(clip(line, width) for line in L)
 
         t = oc["tokens_total"]
-        billable = t["input"] + t["output"]
-        L.append(f"  tokens: {human_count(billable)} billable "
+        input_output = t["input"] + t["output"]
+        L.append(f"  tokens: {human_count(input_output)} input+output "
                  f"(in {human_count(t['input'])} / out {human_count(t['output'])}"
                  f" / reason {human_count(t['reasoning'])})")
         L.append(f"          cache read {human_count(t['cache_read'])}, "
                  f"write {human_count(t['cache_write'])}   "
                  f"{t['turns']} turns"
-                 + (f"   ${oc['cost_usd']:.2f}" if oc["cost_usd"] else "   $0 (local)"))
+                 + (f"   ${oc['cost_usd']:.2f}" if oc["cost_usd"] else "   $0 reported"))
 
         if oc["tokens_by_model"]:
             for label, tk in sorted(oc["tokens_by_model"].items(),
@@ -826,16 +1006,17 @@ def render(snap: dict) -> str:
                 L.append(f"    {day}  {bar(100 * n / peak, 24)} {human_count(n):>9}")
 
         if oc["sessions"]:
+            shown_sessions = oc["sessions"][:8]
             L.append(f"  sessions ({oc['session_count']} in window, "
-                     f"showing {len(oc['sessions'])}):")
-            for s in oc["sessions"][:8]:
+                     f"showing {len(shown_sessions)}):")
+            for s in shown_sessions:
                 ago = human_delta(s["age_seconds"]) if s.get("age_seconds") else "?"
                 tk = s["summed"]["input"] + s["summed"]["output"]
                 model = (s["model"] or "?").split("/")[-1]
                 tag = "+" if s["is_subagent"] else " "
-                name = s["title"] or s["id"]
+                name = s["title"] or s["id"] or "(redacted)"
                 L.append(f"    {ago:>6} ago {human_count(tk):>8} tok  "
-                         f"{tag}{(s['agent'] or '?') + '/' + model:<22} {name[:36]}")
+                         f"{tag}{(s['agent'] or '?') + '/' + model:<22} {clip(name, 36)}")
 
         if oc["todos"]:
             L.append("  open todos:")
@@ -847,7 +1028,7 @@ def render(snap: dict) -> str:
             L.append("  note: session.tokens_* holds the last turn, not the "
                      "lifetime sum; totals above are summed from part rows")
 
-    return "\n".join(L)
+    return "\n".join(clip(line, width) for line in L)
 
 
 # --------------------------------------------------------------------------- #
@@ -861,6 +1042,16 @@ SECTION_ALIASES = {
 }
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer greater than zero") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI surface. Split out from main() so tests can diff it against
     the docs — SKILL.md promises agents a specific set of flags and sections,
@@ -869,40 +1060,68 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agentbox", description="Status probe for a Linux AI agent box.")
     ap.add_argument("section", nargs="?", default="status",
                     choices=sorted(SECTION_ALIASES))
-    ap.add_argument("--json", action="store_true", help="emit JSON")
-    ap.add_argument("--days", type=int, default=7,
+    formats = ap.add_mutually_exclusive_group()
+    formats.add_argument("--json", action="store_true", help="emit one formatted JSON object")
+    formats.add_argument("--jsonl", action="store_true",
+                         help="emit one compact JSON object per line")
+    ap.add_argument("--days", type=positive_int, default=7,
                     help="opencode token window (default 7)")
-    ap.add_argument("--watch", type=int, metavar="SECS",
+    ap.add_argument("--watch", type=positive_int, metavar="SECS",
                     help="refresh every N seconds")
-    ap.add_argument("--no-titles", action="store_true",
-                    help="scrub session titles, paths and cmdlines "
-                         "(use when publishing or logging)")
+    ap.add_argument("--redact", "--no-titles", dest="redact", action="store_true",
+                    help="redact host, network, process and session identifiers")
+    ap.add_argument("--plain", action="store_true",
+                    help="plain output without Unicode decorations or terminal controls")
     return ap
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.json and args.watch is not None:
+        parser.error("--json cannot be used with --watch; use --jsonl --watch")
 
     sections = SECTION_ALIASES[args.section]
 
-    def once():
+    def once() -> bool:
         snap = snapshot(days=args.days, sections=sections,
-                        scrub=args.no_titles)
+                        scrub=args.redact)
         if args.json:
-            print(json.dumps(snap, indent=2, default=str))
+            output = json.dumps(snap, indent=2, default=str)
+        elif args.jsonl:
+            output = json.dumps(snap, separators=(",", ":"), default=str)
         else:
-            print(render(snap))
-
-    if args.watch:
+            width = (shutil.get_terminal_size((120, 24)).columns
+                     if sys.stdout.isatty() else 10_000)
+            output = render(snap, width=width,
+                            plain=args.plain or not sys.stdout.isatty())
         try:
+            print(output, flush=True)
+        except BrokenPipeError:
+            try:
+                sys.stdout.close()
+            except BrokenPipeError:
+                pass
+            return False
+        return True
+
+    if args.watch is not None:
+        try:
+            first = True
             while True:
-                print("\033[2J\033[H", end="")
-                once()
+                if not args.jsonl and sys.stdout.isatty() and not args.plain:
+                    print("\033[2J\033[H", end="")
+                elif not args.jsonl and not first:
+                    print()
+                if not once():
+                    return 0
+                first = False
                 time.sleep(args.watch)
         except KeyboardInterrupt:
             return 0
     else:
-        once()
+        if not once():
+            return 0
     return 0
 
 

@@ -19,6 +19,7 @@ carefully, in one pass.
 agentbox --json                 # everything
 agentbox --json opencode        # just token accounting
 agentbox --json --days 30       # widen the opencode window (default 7)
+agentbox --jsonl --redact       # safe, appendable log record
 ```
 
 ## Sections
@@ -38,11 +39,15 @@ Pass one positional section to narrow the snapshot:
 ## Flags
 
 - `--json` — machine-readable output. Use this.
+- `--jsonl` — one compact JSON object per line, for logging or watch streams.
 - `--days N` — opencode token window in days (default `7`).
-- `--no-titles` — scrub session titles, directories, todo text, DB path, and
-  cmdlines. Use it for anything that gets logged, pasted publicly, or shared.
+- `--redact`, `--no-titles` — remove host, network, process and session
+  identifiers. Use either for anything logged, pasted publicly, or shared;
+  `--no-titles` is the compatibility alias.
+- `--plain` — plain text without Unicode decorations or terminal controls.
 - `--watch N` — foreground redraw loop every N seconds. **Never run this**; it
-  does not terminate. It is for a human at a terminal.
+  does not terminate. It is for a human at a terminal; JSON streaming requires
+  `--jsonl --watch N` because `--json --watch` is rejected.
 
 Env: `AGENTBOX_OPENCODE_DB` overrides the opencode DB path and is authoritative
 — if it points at a missing file, the opencode section reports unavailable
@@ -52,17 +57,18 @@ rather than falling back.
 
 Report in plain language, then flag anything concerning:
 
+- **Summary** — read top-level `status` and `warnings` first. Relay warnings;
+  never interpret a missing collector as a healthy zero.
 - **CPU** — `load_per_core` sustained above ~1.0 means saturated. A single spike
   is not a problem; check `uptime_seconds` and the load triple (1/5/15 min) to
   tell a burst from a trend.
-- **RAM** — judge by `available`, not `free`. Cache is not pressure. Swap in use
+- **RAM** — judge by `available_bytes`, not cache or free memory. Swap in use
   with low available RAM is real pressure.
 - **Disk** — over 85% used is worth raising unprompted.
-- **GPU** — a temperature near its cap alongside a power draw pinned at its
-  limit means thermal throttling.
-- **Tokens** — compare against the per-day breakdown. `cost` is `0` for local
-  models, so the dollar figure only means anything for cloud providers; say so
-  rather than reporting "$0" as if it were a saving.
+- **GPU** — temperatures at or above 85 C deserve attention. Do not claim
+  throttling unless the hardware exposes a limit.
+- **Tokens** — compare against the per-day breakdown. `cost_usd` is only the
+  value reported by opencode; do not infer that zero means local.
 
 ## When the opencode section says `available: false`
 
