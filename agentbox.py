@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -114,6 +116,48 @@ def read(path: str) -> str:
 # --------------------------------------------------------------------------- #
 # collectors
 # --------------------------------------------------------------------------- #
+
+def _parse_pressure(text: str) -> dict | None:
+    result = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] not in ("some", "full"):
+            continue
+        values = {}
+        for token in parts[1:]:
+            key, sep, value = token.partition("=")
+            if not sep:
+                continue
+            try:
+                values["total_us" if key == "total" else key] = (
+                    int(value) if key == "total" else float(value))
+            except ValueError:
+                return None
+        if not {"avg10", "avg60", "avg300", "total_us"} <= values.keys():
+            return None
+        result[parts[0]] = values
+    return result if "some" in result else None
+
+
+def collect_pressure(resources=("cpu", "memory", "io")) -> dict:
+    out = {"available": True, "reason": None}
+    errors = []
+    for resource in resources:
+        path = f"/proc/pressure/{resource}"
+        try:
+            with open(path, errors="replace") as fh:
+                parsed = _parse_pressure(fh.read())
+        except OSError as exc:
+            parsed = None
+            errors.append(f"{resource}: {exc.strerror or exc}")
+        if parsed is None:
+            if not any(error.startswith(f"{resource}:") for error in errors):
+                errors.append(f"{resource}: invalid pressure data")
+        out[resource] = parsed
+    out["available"] = not errors
+    out["reason"] = "; ".join(errors) or None
+    return out
+
 
 def _cpu_totals() -> tuple[int, int]:
     """Return (idle_jiffies, total_jiffies) from /proc/stat."""
@@ -292,27 +336,166 @@ def collect_gpu() -> dict:
             "vendor": vendor, "gpus": gpus, "processes": []}
 
 
-def collect_disk(paths=("/", "/home")) -> list[dict]:
+def _unescape_mountinfo(value: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), value)
+
+
+def _parse_mountinfo(text: str) -> list[dict]:
+    mounts = []
+    for line in text.splitlines():
+        left, sep, right = line.partition(" - ")
+        before, after = left.split(), right.split()
+        if not sep or len(before) < 6 or len(after) < 3:
+            continue
+        mounts.append({
+            "device": before[2],
+            "root": _unescape_mountinfo(before[3]),
+            "mount_point": _unescape_mountinfo(before[4]),
+            "mount_options": before[5].split(","),
+            "filesystem": after[0],
+            "mount_source": _unescape_mountinfo(after[1]),
+            "super_options": after[2].split(","),
+        })
+    return mounts
+
+
+def _mount_for_path(path: str, mounts: list[dict]) -> dict | None:
+    path = os.path.realpath(path)
+    matches = [m for m in mounts
+               if path == m["mount_point"] or
+               path.startswith(m["mount_point"].rstrip("/") + "/")]
+    return max(matches, key=lambda m: len(m["mount_point"])) if matches else None
+
+
+def _diskstats() -> dict[str, tuple[int, int, int]]:
+    stats = {}
+    for line in read("/proc/diskstats").splitlines():
+        fields = line.split()
+        if len(fields) < 14:
+            continue
+        try:
+            stats[f"{fields[0]}:{fields[1]}"] = (
+                int(fields[5]), int(fields[9]), int(fields[12]))
+        except ValueError:
+            continue
+    return stats
+
+
+def collect_disk(paths=("/", "/home"), io_interval: float = 0.1,
+                 deep: bool = False) -> list[dict]:
+    mounts = _parse_mountinfo(read("/proc/self/mountinfo"))
+    io0 = _diskstats() if io_interval else {}
+    if io_interval:
+        time.sleep(io_interval)
+    io1 = _diskstats() if io_interval else {}
     seen, out = set(), []
     for p in paths:
         if not os.path.isdir(p):
             continue
         try:
             st = os.statvfs(p)
+            device = os.stat(p).st_dev
         except OSError:
             continue
-        key = (st.f_blocks, st.f_bsize)
+        mount = _mount_for_path(p, mounts)
+        key = (device, mount["mount_point"] if mount else None)
         if key in seen:
             continue
         seen.add(key)
         total = st.f_blocks * st.f_frsize
         free = st.f_bavail * st.f_frsize
-        out.append({
+        inode_total = st.f_files
+        inode_used = max(0, inode_total - st.f_ffree)
+        item = {
             "path": p, "total_bytes": total, "used_bytes": total - free,
             "free_bytes": free,
             "used_pct": round(100 * (total - free) / total, 1) if total else 0.0,
-        })
+            "inode_total": inode_total,
+            "inode_used": inode_used,
+            "inode_free": st.f_ffree,
+            "inode_available": st.f_favail,
+            "inode_used_pct": (round(100 * inode_used / inode_total, 1)
+                               if inode_total else None),
+            "read_only": bool(st.f_flag & getattr(os, "ST_RDONLY", 1)),
+            "filesystem": mount["filesystem"] if mount else None,
+            "mount_source": mount["mount_source"] if mount else None,
+            "mount_point": mount["mount_point"] if mount else None,
+            "mount_options": mount["mount_options"] if mount else [],
+            "device": mount["device"] if mount else None,
+            "read_bytes_per_sec": None,
+            "write_bytes_per_sec": None,
+            "io_busy_pct": None,
+        }
+        if mount and mount["device"] in io0 and mount["device"] in io1:
+            before, after = io0[mount["device"]], io1[mount["device"]]
+            item["read_bytes_per_sec"] = max(0, after[0] - before[0]) * 512 / io_interval
+            item["write_bytes_per_sec"] = max(0, after[1] - before[1]) * 512 / io_interval
+            item["io_busy_pct"] = round(
+                min(100.0, max(0, after[2] - before[2]) / (io_interval * 10)), 1)
+        out.append(item)
+    if deep:
+        if out:
+            out[0]["deep"] = collect_deep_storage()
     return out
+
+
+DEEP_STORAGE_ROOTS = (
+    ("ollama", "~/.ollama"),
+    ("claude", "~/.claude"),
+    ("opencode", "~/.local/share/opencode"),
+    ("huggingface", "~/.cache/huggingface"),
+    ("llama", "~/.cache/llama.cpp"),
+    ("docker", "/var/lib/docker"),
+)
+
+
+def _path_hash(path: str) -> str:
+    return hashlib.sha256(path.encode()).hexdigest()[:16]
+
+
+def _parse_du_size(raw: str) -> int | None:
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def collect_deep_storage(timeout: int = 15) -> dict:
+    roots = []
+    largest = []
+    errors = []
+    deadline = time.monotonic() + timeout
+    for label, configured in DEEP_STORAGE_ROOTS:
+        if time.monotonic() >= deadline:
+            errors.append("deep storage scan timed out")
+            break
+        root = os.path.abspath(os.path.expanduser(configured))
+        if not os.path.isdir(root):
+            continue
+        roots.append({"name": label, "path": root})
+        remaining = max(1, int(deadline - time.monotonic()))
+        output, error = run_result(
+            ["du", "-B1", "--max-depth=2", "--one-file-system", root],
+            timeout=remaining)
+        if error:
+            errors.append(f"{label}: {error}")
+            continue
+        for line in output.splitlines():
+            size, sep, path = line.partition("\t")
+            if not sep:
+                continue
+            bytes_used = _parse_du_size(size)
+            if bytes_used is None:
+                continue
+            largest.append({"name": label, "path": path, "bytes": bytes_used})
+    largest.sort(key=lambda item: (-item["bytes"], item["path"]))
+    return {
+        "available": not errors,
+        "reason": "; ".join(errors) or None,
+        "roots": roots,
+        "largest": largest[:30],
+        "partial": bool(errors),
+    }
 
 
 def collect_services() -> dict:
@@ -362,21 +545,64 @@ def collect_services() -> dict:
             "watched": watched, "failed": failed}
 
 
+LAN_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+    "fc00::/7", "fe80::/10",
+))
+
+
+def _split_endpoint(endpoint: str) -> tuple[str, str]:
+    if endpoint.startswith("[") and "]:" in endpoint:
+        host, port = endpoint[1:].split("]: ", 1) if "]: " in endpoint else endpoint[1:].split("]:", 1)
+        return host, port
+    host, sep, port = endpoint.rpartition(":")
+    return (host, port) if sep else (endpoint, "")
+
+
+def _tailscale_addresses() -> set[str]:
+    output = run(["tailscale", "ip"])
+    return {line.strip() for line in output.splitlines() if line.strip()}
+
+
+def _listener_scope(host: str, tailscale_addresses: set[str] | None = None) -> str:
+    bare = host.split("%", 1)[0]
+    if bare in ("*", "0.0.0.0", "::"):
+        return "wildcard"
+    try:
+        address = ipaddress.ip_address(bare)
+    except ValueError:
+        return "unknown"
+    if address.is_loopback:
+        return "loopback"
+    if bare in (tailscale_addresses or set()):
+        return "tailscale"
+    if any(address in network for network in LAN_NETWORKS):
+        return "lan"
+    return "external"
+
+
 def collect_listeners() -> tuple[list[dict], str | None]:
     """Listening TCP sockets with owning process - shows agent servers."""
     out, error = run_result(["ss", "-ltnpH"])
+    tailscale_addresses = _tailscale_addresses()
     res = []
     for line in out.splitlines():
         cols = line.split()
         if len(cols) < 4:
             continue
         addr = cols[3]
-        proc = ""
+        proc, process_name, pid = "", None, None
         m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
         if m:
-            proc = f"{m.group(1)}({m.group(2)})"
-        port = addr.rsplit(":", 1)[-1]
-        res.append({"address": addr, "port": port, "process": proc})
+            process_name, pid = m.group(1), int(m.group(2))
+            proc = f"{process_name}({pid})"
+        host, port = _split_endpoint(addr)
+        res.append({
+            "address": addr, "host": host, "port": port,
+            "scope": _listener_scope(host, tailscale_addresses), "process": proc,
+            "process_name": process_name, "pid": pid,
+            "agent_kind": _agent_kind_from_names([process_name]),
+        })
     return res, error
 
 
@@ -482,7 +708,20 @@ def _tty_of(pid: int) -> str | None:
         return None
 
 
-AGENT_EXES = ("opencode", "llama-server", "llama", "ollama")
+def _agent_kind_from_names(names) -> str | None:
+    for name in names:
+        if not name:
+            continue
+        base = os.path.basename(name).removesuffix(".js").removesuffix(".mjs")
+        if base in ("opencode", "opencode-desktop", "opencode-deskto"):
+            return "opencode"
+        if base == "claude":
+            return "claude"
+        if base == "ollama":
+            return "ollama"
+        if base.startswith("llama"):
+            return "llama"
+    return None
 
 
 def _is_agent_proc(pid: int, cmd: str) -> str | None:
@@ -497,21 +736,15 @@ def _is_agent_proc(pid: int, cmd: str) -> str | None:
     # node/bun launchers: the real program is argv[1]
     if names[1] in ("node", "bun", "deno") and len(argv) > 1:
         names.append(os.path.basename(argv[1]))
-    for n in names:
-        if not n:
-            continue
-        base = n.removesuffix(".js").removesuffix(".mjs")
-        if base in ("opencode", "opencode-desktop"):
-            return "opencode"
-        if base in ("ollama",):
-            return "ollama"
-        if base.startswith("llama"):
-            return "llama"
-    return None
+        script = argv[1].replace("\\", "/")
+        if (script.endswith("/cli.js") and
+                "/@anthropic-ai/claude-code/" in script):
+            return "claude"
+    return _agent_kind_from_names(names)
 
 
 def _agent_processes(scrub: bool = False) -> list[dict]:
-    """Live opencode / llama / ollama processes, read straight from /proc."""
+    """Live AI agent and model runtime processes, read straight from /proc."""
     procs = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -543,7 +776,243 @@ def _agent_processes(scrub: bool = False) -> list[dict]:
     return procs
 
 
-def collect_opencode(days: int = 7, scrub: bool = False) -> dict:
+def collect_agents(processes: list[dict]) -> dict:
+    public = [{k: v for k, v in proc.items() if k != "cmdline"} for proc in processes]
+    counts = {kind: sum(p["kind"] == kind for p in public)
+              for kind in ("opencode", "claude", "ollama", "llama")}
+    return {"processes": public, "counts": counts}
+
+
+def _numeric(value) -> int:
+    try:
+        value = int(value)
+        return value if value >= 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _timestamp(value) -> float | None:
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 10_000_000_000 else float(value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _claude_usage(record: dict) -> dict | None:
+    message = record.get("message") if isinstance(record.get("message"), dict) else record
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    return {
+        "input": _numeric(usage.get("input_tokens")),
+        "output": _numeric(usage.get("output_tokens")),
+        "cache_read": _numeric(usage.get("cache_read_input_tokens")),
+        "cache_write": _numeric(usage.get("cache_creation_input_tokens")),
+    }
+
+
+def collect_claude(days: int = 7, scrub: bool = False) -> dict:
+    root = os.path.expanduser("~/.claude/projects")
+    out = {
+        "available": False, "reason": None, "source": "local_files",
+        "version": None, "window_days": days, "projects": [],
+        "totals": dict(ZERO_TOKENS, turns=0),
+        "parse": {"files_seen": 0, "files_failed": 0, "records_ignored": 0,
+                  "records_recognized": 0},
+        "cost_usd": None,
+    }
+    if not os.path.isdir(root):
+        out["reason"] = "Claude Code projects directory not found"
+        return out
+
+    version = run(["claude", "--version"]).strip().splitlines()
+    out["version"] = version[0] if version else None
+    cutoff = time.time() - days * 86400
+    projects = {}
+    for project_dir, _, filenames in os.walk(root):
+        for filename in filenames:
+            if not filename.endswith(".jsonl"):
+                continue
+            path = os.path.join(project_dir, filename)
+            out["parse"]["files_seen"] += 1
+            project = projects.setdefault(project_dir, {
+                "project_hash": f"sha256:{_path_hash(project_dir)}",
+                "sessions": 0, "last_activity": None,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            })
+            valid_session = False
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if len(line) > 2_000_000:
+                            out["parse"]["records_ignored"] += 1
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            out["parse"]["records_ignored"] += 1
+                            continue
+                        if not isinstance(record, dict):
+                            out["parse"]["records_ignored"] += 1
+                            continue
+                        timestamp = _timestamp(record.get("timestamp"))
+                        usage = _claude_usage(record)
+                        if usage is None:
+                            continue
+                        out["parse"]["records_recognized"] += 1
+                        if timestamp is None or timestamp < cutoff:
+                            continue
+                        valid_session = True
+                        for key, value in usage.items():
+                            target = f"{key}_tokens" if key != "input" and key != "output" else f"{key}_tokens"
+                            project[target] = project.get(target, 0) + value
+                            total_key = key if key in ZERO_TOKENS else key
+                            if total_key in out["totals"]:
+                                out["totals"][total_key] += value
+                        project["last_activity"] = max(
+                            project["last_activity"] or 0, timestamp)
+                        out["totals"]["turns"] += 1
+                    if valid_session:
+                        project["sessions"] += 1
+            except OSError:
+                out["parse"]["files_failed"] += 1
+
+    for project in projects.values():
+        if project["sessions"]:
+            if project["last_activity"]:
+                project["last_activity"] = datetime.fromtimestamp(
+                    project["last_activity"], timezone.utc).isoformat(timespec="seconds")
+            out["projects"].append(project)
+    out["projects"].sort(key=lambda item: item["project_hash"])
+    recognized = out["parse"]["records_recognized"]
+    out["available"] = bool(recognized or not out["parse"]["files_seen"])
+    if not out["available"]:
+        out["reason"] = "Claude Code JSONL schema unsupported"
+    elif out["parse"]["files_failed"]:
+        out["reason"] = "some Claude Code files could not be read"
+    return out
+
+
+def _ollama_size(value: str) -> int | None:
+    match = re.fullmatch(r"([0-9.]+)\s*([KMGT]B|[KMGT]iB|B)", value.strip(), re.I)
+    if not match:
+        return None
+    try:
+        amount = float(match.group(1))
+    except ValueError:
+        return None
+    units = {"B": 0, "KB": 1, "KIB": 1, "MB": 2, "MIB": 2,
+             "GB": 3, "GIB": 3, "TB": 4, "TIB": 4}
+    return int(amount * 1024 ** units[match.group(2).upper()])
+
+
+def _parse_ollama_table(output: str) -> list[list[str]]:
+    rows = []
+    for line in output.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 4:
+            rows.append(parts)
+    return rows
+
+
+def collect_ollama(scrub: bool = False) -> dict:
+    out = {"available": False, "reason": None, "source": "ollama_cli",
+           "version": None, "models": [], "running": []}
+    version = run(["ollama", "--version"]).strip()
+    out["version"] = version or None
+    listing, list_error = run_result(["ollama", "list"])
+    if list_error:
+        out["reason"] = list_error
+        return out
+    for row in _parse_ollama_table(listing):
+        if len(row) < 5:
+            continue
+        name, model_id = row[0], row[1]
+        size_text = " ".join(row[2:4])
+        size_bytes = _ollama_size(size_text)
+        if size_bytes is None:
+            continue
+        item = {"name": name, "id": model_id, "size_bytes": size_bytes,
+                "modified": " ".join(row[4:])}
+        if scrub:
+            item["name"] = f"sha256:{_path_hash(name)}"
+            item["id"] = None
+        out["models"].append(item)
+    running, running_error = run_result(["ollama", "ps"])
+    if not running_error:
+        for row in _parse_ollama_table(running):
+            name = row[0]
+            out["running"].append({
+                "name": f"sha256:{_path_hash(name)}" if scrub else name,
+                "id": None if scrub else (row[1] if len(row) > 1 else None),
+                "raw": None if scrub else " ".join(row[2:]),
+            })
+    out["available"] = True
+    return out
+
+
+def collect_changes(scrub: bool = False) -> dict:
+    out = {"available": False, "reason": None, "source": "git", "root": None,
+           "head": None, "dirty": False,
+           "counts": {"modified": 0, "added": 0, "deleted": 0,
+                      "renamed": 0, "untracked": 0},
+           "diff": {"files": 0, "insertions": 0, "deletions": 0},
+           "fingerprint": None}
+    root, error = run_result(["git", "rev-parse", "--show-toplevel"])
+    if error or not root.strip():
+        out["reason"] = error or "not a git repository"
+        return out
+    root = root.strip()
+    out["root"] = None if scrub else root
+    head, head_error = run_result(["git", "log", "-1", "--format=%H%x00%s%x00%ct"])
+    status, status_error = run_result(["git", "status", "--porcelain=v1", "--untracked-files=all"])
+    numstat, numstat_error = run_result(["git", "diff", "HEAD", "--numstat"])
+    if head_error or status_error or numstat_error:
+        out["reason"] = "; ".join(e for e in (head_error, status_error, numstat_error) if e)
+        return out
+    head_parts = head.rstrip("\n").split("\0")
+    if len(head_parts) >= 3:
+        out["head"] = {"sha": head_parts[0], "subject": None if scrub else head_parts[1],
+                       "timestamp": datetime.fromtimestamp(int(head_parts[2]), timezone.utc).isoformat()}
+    for line in status.splitlines():
+        if len(line) < 3:
+            continue
+        code = line[:2]
+        if code == "??":
+            out["counts"]["untracked"] += 1
+        elif "R" in code:
+            out["counts"]["renamed"] += 1
+        else:
+            if "A" in code:
+                out["counts"]["added"] += 1
+            if "D" in code:
+                out["counts"]["deleted"] += 1
+            if "M" in code or "T" in code:
+                out["counts"]["modified"] += 1
+    for line in numstat.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            out["diff"]["insertions"] += int(parts[0]) if parts[0].isdigit() else 0
+            out["diff"]["deletions"] += int(parts[1]) if parts[1].isdigit() else 0
+            out["diff"]["files"] += 1
+        except ValueError:
+            continue
+    out["dirty"] = bool(status.strip())
+    fingerprint = json.dumps({"head": head, "status": status, "numstat": numstat}, sort_keys=True)
+    out["fingerprint"] = f"sha256:{hashlib.sha256(fingerprint.encode()).hexdigest()[:16]}"
+    out["available"] = True
+    return out
+
+
+def collect_opencode(days: int = 7, scrub: bool = False,
+                     live_processes: list[dict] | None = None) -> dict:
     """Token + session accounting straight from opencode's SQLite DB.
 
     Tokens are summed from `part` rows of type 'step-finish' (the per-turn
@@ -558,7 +1027,8 @@ def collect_opencode(days: int = 7, scrub: bool = False) -> dict:
         "version": None,   # filled from session.version below - no subprocess
         "tested_version": TESTED_OPENCODE_VERSION,
         "window_days": days,
-        "live_processes": _agent_processes(scrub),
+        "live_processes": (_agent_processes(scrub) if live_processes is None
+                           else live_processes),
         "sessions": [],
         "session_count": 0,
         "tokens_total": dict(ZERO_TOKENS, turns=0),
@@ -746,6 +1216,26 @@ def collect_warnings(snap: dict) -> list[dict]:
     for disk in snap.get("disk", []):
         if disk["used_pct"] >= 85:
             add("disk_high", f"{disk['path']} is {disk['used_pct']:.1f}% full")
+        if disk.get("inode_used_pct") is not None and disk["inode_used_pct"] >= 85:
+            add("inode_high", f"{disk['path']} inodes are {disk['inode_used_pct']:.1f}% used")
+        if disk.get("read_only"):
+            add("disk_read_only", f"{disk['path']} is mounted read-only")
+        if disk.get("deep", {}).get("partial"):
+            add("disk_deep_partial", "deep storage scan completed with errors")
+
+    if pressure := snap.get("pressure"):
+        if not pressure.get("available", True):
+            add("pressure_unavailable",
+                f"pressure data unavailable: {pressure.get('reason') or 'unknown error'}")
+        cpu = (pressure.get("cpu") or {}).get("some", {}).get("avg10", 0)
+        memory = (pressure.get("memory") or {}).get("full", {}).get("avg10", 0)
+        io = (pressure.get("io") or {}).get("full", {}).get("avg10", 0)
+        if cpu >= 50:
+            add("cpu_pressure_high", f"CPU pressure is {cpu:.1f}% over 10 seconds")
+        if memory >= 5:
+            add("memory_pressure_high", f"memory full pressure is {memory:.1f}%")
+        if io >= 10:
+            add("io_pressure_high", f"I/O full pressure is {io:.1f}%")
 
     if g := snap.get("gpu"):
         if not g.get("available", True):
@@ -771,12 +1261,27 @@ def collect_warnings(snap: dict) -> list[dict]:
             add("listener_owners_unavailable",
                 "listener ownership unavailable; run with sufficient permissions")
 
+    for listener in snap.get("listening", []):
+        if (listener.get("agent_kind") and
+                listener.get("scope") in ("wildcard", "lan", "external")):
+            scope = {"wildcard": "all interfaces", "lan": "the LAN",
+                     "external": "an external address"}[listener["scope"]]
+            add("agent_server_exposed", f"{listener['agent_kind']} listens on "
+                f"{scope} at {listener['address']}")
+
     if oc := snap.get("opencode"):
         if not oc.get("available"):
             add("opencode_unavailable", f"opencode data unavailable: {oc.get('reason')}")
         elif oc.get("version") and oc["version"] != oc["tested_version"]:
             add("opencode_version", f"opencode {oc['version']} differs from tested "
                 f"{oc['tested_version']}")
+    for name in ("claude", "ollama"):
+        if provider := snap.get(name):
+            if not provider.get("available"):
+                add(f"{name}_unavailable",
+                    f"{name} data unavailable: {provider.get('reason') or 'unknown error'}")
+            elif provider.get("reason"):
+                add(f"{name}_partial", f"{name} data is partial: {provider['reason']}")
     return warnings
 
 
@@ -790,10 +1295,24 @@ def redact_snapshot(snap: dict) -> None:
     for listener in snap.get("listening", []):
         listener["address"] = f"*:{listener['port']}"
         listener["process"] = "(redacted)" if listener["process"] else ""
+        listener["host"] = "*"
+        listener["process_name"] = "(redacted)" if listener.get("process_name") else None
+        listener["pid"] = None
     if gpu := snap.get("gpu"):
         for proc in gpu.get("processes", []):
             proc["pid"] = None
             proc["name"] = "(redacted)"
+    for disk in snap.get("disk", []):
+        if disk.get("mount_source"):
+            disk["mount_source"] = "(redacted)"
+        if deep := disk.get("deep"):
+            if deep.get("reason"):
+                deep["reason"] = "one or more storage roots could not be read"
+            for root in deep.get("roots", []):
+                root["path"] = None
+            for item in deep.get("largest", []):
+                item["path_hash"] = f"sha256:{_path_hash(item['path'])}"
+                item["path"] = None
     if oc := snap.get("opencode"):
         oc["db_path"] = None
         for proc in oc.get("live_processes", []):
@@ -808,11 +1327,33 @@ def redact_snapshot(snap: dict) -> None:
         for todo in oc.get("todos", []):
             todo["session_id"] = None
             todo["content"] = None
+    if agents := snap.get("agents"):
+        for proc in agents.get("processes", []):
+            proc["pid"] = None
+            proc["tty"] = None
+    if claude := snap.get("claude"):
+        for project in claude.get("projects", []):
+            project.pop("path", None)
+    if ollama := snap.get("ollama"):
+        for model in ollama.get("models", []):
+            if not model["name"].startswith("sha256:"):
+                model["name"] = f"sha256:{_path_hash(model['name'])}"
+            model["id"] = None
+        for model in ollama.get("running", []):
+            model["id"] = None
+            if not model["name"].startswith("sha256:"):
+                model["name"] = f"sha256:{_path_hash(model['name'])}"
+    if changes := snap.get("changes"):
+        changes["root"] = None
+        if changes.get("head"):
+            changes["head"]["sha"] = None
+            changes["head"]["subject"] = None
 
 
 def snapshot(days: int = 7, sections: set[str] | None = None,
-             scrub: bool = False) -> dict:
-    want = sections or {"cpu", "mem", "gpu", "disk", "services", "opencode"}
+             scrub: bool = False, deep: bool = False) -> dict:
+    want = sections or {"cpu", "mem", "gpu", "disk", "pressure", "services",
+                        "agents", "opencode"}
     snap = {
         "hostname": os.uname().nodename,
         "kernel": os.uname().release,
@@ -822,10 +1363,12 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
         snap["cpu"] = collect_cpu_and_procs()
     if "mem" in want:
         snap["memory"] = collect_mem()
+    if "pressure" in want:
+        snap["pressure"] = collect_pressure()
     if "gpu" in want:
         snap["gpu"] = collect_gpu()
     if "disk" in want:
-        snap["disk"] = collect_disk()
+        snap["disk"] = collect_disk(deep=deep)
     if "services" in want:
         snap["services"] = collect_services()
         snap["listening"], listener_error = collect_listeners()
@@ -833,12 +1376,22 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
         snap["services"]["listeners_reason"] = listener_error
         snap["services"]["listener_owners_available"] = (
             not snap["listening"] or all(item["process"] for item in snap["listening"]))
+    processes = _agent_processes(scrub) if want & {"agents", "opencode"} else []
+    if "agents" in want:
+        snap["agents"] = collect_agents(processes)
     if "opencode" in want:
-        snap["opencode"] = collect_opencode(days, scrub=scrub)
-    snap["warnings"] = collect_warnings(snap)
-    snap["status"] = "WARNING" if snap["warnings"] else "OK"
+        snap["opencode"] = collect_opencode(
+            days, scrub=scrub, live_processes=processes)
+    if "claude" in want:
+        snap["claude"] = collect_claude(days, scrub=scrub)
+    if "ollama" in want:
+        snap["ollama"] = collect_ollama(scrub=scrub)
+    if "changes" in want:
+        snap["changes"] = collect_changes(scrub=scrub)
     if scrub:
         redact_snapshot(snap)
+    snap["warnings"] = collect_warnings(snap)
+    snap["status"] = "WARNING" if snap["warnings"] else "OK"
     return snap
 
 
@@ -886,6 +1439,14 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
             L.append(f"SWAP  {meter}{m['swap_used_pct']:5.1f}%  "
                      f"{human_bytes(m['swap_used_bytes'])} / {human_bytes(m['swap_total_bytes'])}")
 
+    if pressure := snap.get("pressure"):
+        values = []
+        for resource, level in (("cpu", "some"), ("memory", "full"), ("io", "full")):
+            avg10 = (pressure.get(resource) or {}).get(level, {}).get("avg10")
+            values.append(f"{resource} {level} {avg10:.1f}%" if avg10 is not None
+                          else f"{resource} unavailable")
+        L.append("PSI   " + "   ".join(values) + "  (avg10)")
+
     g = snap.get("gpu")
     if g and not g.get("available", True):
         L.append(f"GPU   data unavailable: {g.get('reason') or 'unknown error'}")
@@ -921,6 +1482,24 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
         L.append(f"DISK  {meter}{d['used_pct']:5.1f}%  {d['path']}  "
                  f"{human_bytes(d['used_bytes'])} / {human_bytes(d['total_bytes'])}"
                  f"   ({human_bytes(d['free_bytes'])} free)")
+        details = []
+        if d.get("filesystem"):
+            details.append(f"{d['filesystem']} on {d.get('mount_source') or '?'}")
+        if d.get("inode_used_pct") is not None:
+            details.append(f"inodes {d['inode_used_pct']:.1f}%")
+        if d.get("read_only"):
+            details.append("read-only")
+        if d.get("read_bytes_per_sec") is not None:
+            details.append(f"I/O {human_bytes(d['read_bytes_per_sec'])}/s read "
+                           f"{human_bytes(d['write_bytes_per_sec'])}/s write")
+        if details:
+            L.append("      " + "   ".join(details))
+        if deep := d.get("deep"):
+            L.append(f"      AI STORAGE  {len(deep['roots'])} roots, "
+                     f"{len(deep['largest'])} entries"
+                     + ("  partial" if deep.get("partial") else ""))
+            for item in deep.get("largest", [])[:8]:
+                L.append(f"        {human_bytes(item['bytes']):>8}  {item['path']}")
 
     if c := snap.get("cpu"):
         if c.get("top"):
@@ -930,6 +1509,17 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
                 pid = str(p["pid"]) if p.get("pid") is not None else "-"
                 L.append(f"  {p['cpu_pct']:5.1f}%cpu  {human_bytes(p['rss_bytes']):>7} rss  "
                          f"{pid:>7}  {p['cmdline'][:64]}")
+
+    if agents := snap.get("agents"):
+        L.append("")
+        counts = [f"{kind} {count}" for kind, count in agents["counts"].items() if count]
+        L.append("AGENTS  " + ("   ".join(counts) if counts else "none running"))
+        for proc in agents["processes"]:
+            age = human_delta(proc["age_seconds"]) if proc.get("age_seconds") else "?"
+            pid = str(proc["pid"]) if proc.get("pid") is not None else "-"
+            tty = proc.get("tty") or "-"
+            L.append(f"  > {proc['kind']:<9} pid {pid:<7} {tty:<9} "
+                     f"up {age:<7} {human_bytes(proc['rss_bytes']):>7} rss")
 
     if s := snap.get("services"):
         L.append("")
@@ -955,7 +1545,8 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
         L.append("LISTENING")
         for listener in listeners[:12]:
             owner = listener["process"] or "(owner unavailable)"
-            L.append(f"  {listener['address']:<28} {owner}")
+            scope = f" [{listener.get('scope')}]" if listener.get("scope") else ""
+            L.append(f"  {listener['address']:<28} {owner}{scope}")
 
     if oc := snap.get("opencode"):
         L.append("")
@@ -968,16 +1559,17 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
             L.append(f"  ! schema tested against v{oc['tested_version']}; "
                      f"verify token numbers")
 
-        live = oc.get("live_processes") or []
-        if live:
-            for p in live:
-                age = human_delta(p["age_seconds"]) if p["age_seconds"] else "?"
-                tty = p["tty"] or "-"
-                pid = str(p["pid"]) if p.get("pid") is not None else "-"
-                L.append(f"  > {p['kind']:<9} pid {pid:<7} {tty:<9} "
-                         f"up {age:<7} {human_bytes(p['rss_bytes']):>7} rss")
-        else:
-            L.append("  no opencode/llama/ollama process running")
+        if "agents" not in snap:
+            live = oc.get("live_processes") or []
+            if live:
+                for p in live:
+                    age = human_delta(p["age_seconds"]) if p["age_seconds"] else "?"
+                    tty = p["tty"] or "-"
+                    pid = str(p["pid"]) if p.get("pid") is not None else "-"
+                    L.append(f"  > {p['kind']:<9} pid {pid:<7} {tty:<9} "
+                             f"up {age:<7} {human_bytes(p['rss_bytes']):>7} rss")
+            else:
+                L.append("  no opencode/claude/llama/ollama process running")
 
         if not oc.get("available"):
             L.append(f"  tokens unavailable: {oc.get('reason')}")
@@ -1028,6 +1620,46 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
             L.append("  note: session.tokens_* holds the last turn, not the "
                      "lifetime sum; totals above are summed from part rows")
 
+    if claude := snap.get("claude"):
+        L.append("")
+        L.append(f"CLAUDE CODE  (last {claude['window_days']}d)"
+                 + (f"   v{claude['version']}" if claude.get("version") else ""))
+        if not claude.get("available"):
+            L.append(f"  unavailable: {claude.get('reason')}")
+        else:
+            total = claude["totals"]
+            L.append(f"  tokens: {human_count(total['input'] + total['output'])} input+output "
+                     f"(in {human_count(total['input'])} / out {human_count(total['output'])})"
+                     f"   {total['turns']} turns   $0 not estimated")
+            L.append(f"  projects: {len(claude['projects'])}   "
+                     f"files: {claude['parse']['files_seen']}   "
+                     f"ignored: {claude['parse']['records_ignored']}")
+
+    if ollama := snap.get("ollama"):
+        L.append("")
+        L.append("OLLAMA MODELS")
+        if not ollama.get("available"):
+            L.append(f"  unavailable: {ollama.get('reason')}")
+        else:
+            for model in ollama.get("models", []):
+                L.append(f"  {model['name']:<24} {human_bytes(model['size_bytes'] or 0):>8}  "
+                         f"{model['modified']}")
+            if ollama.get("running"):
+                L.append("  running: " + ", ".join(m["name"] for m in ollama["running"]))
+
+    if changes := snap.get("changes"):
+        L.append("")
+        L.append("REPOSITORY")
+        if not changes.get("available"):
+            L.append(f"  unavailable: {changes.get('reason')}")
+        else:
+            c = changes["counts"]
+            L.append(f"  {'dirty' if changes['dirty'] else 'clean'}  "
+                     f"{c['modified']} modified, {c['untracked']} untracked, "
+                     f"{c['added']} added, {c['deleted']} deleted")
+            if changes.get("head"):
+                L.append(f"  HEAD {changes['head']['sha'][:12]}  {changes['head']['subject'] or '(redacted)'}")
+
     return "\n".join(clip(line, width) for line in L)
 
 
@@ -1037,6 +1669,10 @@ SECTION_ALIASES = {
     "status": None, "all": None,
     "cpu": {"cpu"}, "procs": {"cpu"}, "mem": {"mem"}, "ram": {"mem"},
     "gpu": {"gpu"}, "disk": {"disk"},
+    "pressure": {"pressure"}, "psi": {"pressure"},
+    "agents": {"agents"},
+    "claude": {"claude"}, "ollama": {"ollama"},
+    "changes": {"changes"},
     "services": {"services"}, "svc": {"services"},
     "opencode": {"opencode"}, "oc": {"opencode"}, "tokens": {"opencode"},
 }
@@ -1072,6 +1708,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="redact host, network, process and session identifiers")
     ap.add_argument("--plain", action="store_true",
                     help="plain output without Unicode decorations or terminal controls")
+    ap.add_argument("--check", action="store_true",
+                    help="exit 1 when the snapshot contains warnings")
+    ap.add_argument("--deep", action="store_true",
+                    help="deep AI storage scan (use with disk)")
     return ap
 
 
@@ -1080,12 +1720,14 @@ def main() -> int:
     args = parser.parse_args()
     if args.json and args.watch is not None:
         parser.error("--json cannot be used with --watch; use --jsonl --watch")
+    if args.check and args.watch is not None:
+        parser.error("--check cannot be used with --watch")
 
     sections = SECTION_ALIASES[args.section]
 
-    def once() -> bool:
+    def once() -> tuple[bool, bool]:
         snap = snapshot(days=args.days, sections=sections,
-                        scrub=args.redact)
+                        scrub=args.redact, deep=args.deep)
         if args.json:
             output = json.dumps(snap, indent=2, default=str)
         elif args.jsonl:
@@ -1102,8 +1744,8 @@ def main() -> int:
                 sys.stdout.close()
             except BrokenPipeError:
                 pass
-            return False
-        return True
+            return False, bool(snap["warnings"])
+        return True, bool(snap["warnings"])
 
     if args.watch is not None:
         try:
@@ -1113,15 +1755,18 @@ def main() -> int:
                     print("\033[2J\033[H", end="")
                 elif not args.jsonl and not first:
                     print()
-                if not once():
+                printed, _ = once()
+                if not printed:
                     return 0
                 first = False
                 time.sleep(args.watch)
         except KeyboardInterrupt:
             return 0
     else:
-        if not once():
-            return 0
+        printed, warned = once()
+        if not printed:
+            return 1 if args.check and warned else 0
+        return 1 if args.check and warned else 0
     return 0
 
 

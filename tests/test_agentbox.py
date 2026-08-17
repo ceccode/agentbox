@@ -11,6 +11,7 @@ import io
 import os
 import sqlite3
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -223,6 +224,220 @@ class TestCLI(unittest.TestCase):
                 mock.patch.object(agentbox, "snapshot", return_value=snap), \
                 mock.patch.object(sys, "stdout", stdout):
             self.assertEqual(agentbox.main(), 0)
+
+    def test_closed_pipe_preserves_check_warning_exit(self):
+        class ClosedPipe(io.StringIO):
+            def write(self, value):
+                raise BrokenPipeError
+
+            def close(self):
+                pass
+
+        snap = {"hostname": "box", "timestamp": "now", "status": "WARNING",
+                "warnings": [{"code": "test", "message": "warning"}]}
+        with mock.patch.object(sys, "argv", ["agentbox", "--check", "--jsonl"]), \
+                mock.patch.object(agentbox, "snapshot", return_value=snap), \
+                mock.patch.object(sys, "stdout", ClosedPipe()):
+            self.assertEqual(agentbox.main(), 1)
+
+    def test_check_exit_codes(self):
+        stdout = io.StringIO()
+        warning = {"hostname": "box", "timestamp": "now", "status": "WARNING",
+                   "warnings": [{"code": "test", "message": "warning"}]}
+        with mock.patch.object(sys, "argv", ["agentbox", "--check", "cpu"]), \
+                mock.patch.object(agentbox, "snapshot", return_value=warning), \
+                mock.patch.object(sys, "stdout", stdout):
+            self.assertEqual(agentbox.main(), 1)
+
+        healthy = dict(warning, status="OK", warnings=[])
+        with mock.patch.object(sys, "argv", ["agentbox", "--check", "cpu"]), \
+                mock.patch.object(agentbox, "snapshot", return_value=healthy), \
+                mock.patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(agentbox.main(), 0)
+
+    def test_check_watch_is_rejected(self):
+        with mock.patch.object(sys, "argv", ["agentbox", "--check", "--watch", "1"]), \
+                mock.patch.object(sys, "stderr", io.StringIO()), \
+                self.assertRaises(SystemExit):
+            agentbox.main()
+
+
+class TestReleaseOneCollectors(unittest.TestCase):
+    PRESSURE = ("some avg10=1.25 avg60=2.50 avg300=3.75 total=123\n"
+                "full avg10=0.10 avg60=0.20 avg300=0.30 total=45\n")
+
+    def test_parse_pressure(self):
+        parsed = agentbox._parse_pressure(self.PRESSURE)
+        self.assertEqual(parsed["some"]["avg10"], 1.25)
+        self.assertEqual(parsed["full"]["total_us"], 45)
+
+    def test_parse_pressure_requires_complete_some_line(self):
+        self.assertIsNone(agentbox._parse_pressure("some avg10=1 total=2"))
+
+    def test_parse_mountinfo_and_select_longest_mount(self):
+        text = (
+            "44 1 259:2 / / rw,relatime shared:1 - ext4 /dev/root rw\n"
+            "45 44 259:3 / /home/data\\040set ro,relatime - ext4 /dev/data ro\n"
+        )
+        mounts = agentbox._parse_mountinfo(text)
+        self.assertEqual(mounts[1]["mount_point"], "/home/data set")
+        self.assertEqual(agentbox._mount_for_path("/home/data set/file", mounts)["device"],
+                         "259:3")
+
+    def test_listener_endpoint_scopes(self):
+        cases = {
+            "0.0.0.0:22": ("0.0.0.0", "22", "wildcard"),
+            "127.0.0.1:631": ("127.0.0.1", "631", "loopback"),
+            "100.105.6.51:80": ("100.105.6.51", "80", "tailscale"),
+            "192.168.1.2:80": ("192.168.1.2", "80", "lan"),
+            "[::1]:631": ("::1", "631", "loopback"),
+            "[2001:4860:4860::8888]:53": ("2001:4860:4860::8888", "53", "external"),
+        }
+        for endpoint, expected in cases.items():
+            with self.subTest(endpoint=endpoint):
+                host, port = agentbox._split_endpoint(endpoint)
+                tailscale = {"100.105.6.51"}
+                self.assertEqual((host, port, agentbox._listener_scope(host, tailscale)),
+                                 expected)
+
+    def test_agent_listener_is_structured(self):
+        output = ('LISTEN 0 4096 0.0.0.0:11434 0.0.0.0:* '
+                  'users:(("ollama",pid=42,fd=3))\n')
+        with mock.patch.object(agentbox, "run_result", return_value=(output, None)), \
+                mock.patch.object(agentbox, "_tailscale_addresses", return_value=set()):
+            listeners, error = agentbox.collect_listeners()
+        self.assertIsNone(error)
+        self.assertEqual(listeners[0]["agent_kind"], "ollama")
+        self.assertEqual(listeners[0]["scope"], "wildcard")
+        self.assertEqual(listeners[0]["pid"], 42)
+
+    def test_claude_process_detection_is_exact(self):
+        with mock.patch.object(agentbox, "read", return_value="claude\n"):
+            self.assertEqual(agentbox._is_agent_proc(1, "/home/user/.local/bin/claude"),
+                             "claude")
+        self.assertIsNone(agentbox._agent_kind_from_names(["claude-code-url-handler"]))
+        with mock.patch.object(agentbox, "read", return_value="node\n"):
+            command = "node /opt/node_modules/@anthropic-ai/claude-code/cli.js"
+            self.assertEqual(agentbox._is_agent_proc(1, command), "claude")
+        self.assertEqual(agentbox._agent_kind_from_names(["opencode-deskto"]), "opencode")
+
+    def test_agents_counts_providers_without_cmdline(self):
+        agents = agentbox.collect_agents([
+            {"kind": "claude", "pid": 1, "cmdline": "secret", "rss_bytes": 10,
+             "tty": None, "age_seconds": 2},
+            {"kind": "opencode", "pid": 2, "cmdline": "secret", "rss_bytes": 20,
+             "tty": None, "age_seconds": 3},
+        ])
+        self.assertEqual(agents["counts"]["claude"], 1)
+        self.assertNotIn("cmdline", agents["processes"][0])
+
+    def test_new_warning_codes(self):
+        snap = {
+            "disk": [{"path": "/", "used_pct": 10, "inode_used_pct": 90,
+                      "read_only": True}],
+            "listening": [{"agent_kind": "ollama", "scope": "wildcard",
+                           "address": "0.0.0.0:11434"}],
+            "pressure": {"cpu": {"some": {"avg10": 51}},
+                         "memory": {"full": {"avg10": 6}},
+                         "io": {"full": {"avg10": 11}}},
+        }
+        codes = {warning["code"] for warning in agentbox.collect_warnings(snap)}
+        self.assertEqual(codes, {"inode_high", "disk_read_only", "agent_server_exposed",
+                                 "cpu_pressure_high", "memory_pressure_high",
+                                 "io_pressure_high"})
+
+    def test_unavailable_pressure_is_warning(self):
+        warnings = agentbox.collect_warnings({
+            "pressure": {"available": False, "reason": "not mounted",
+                         "cpu": None, "memory": None, "io": None},
+        })
+        self.assertEqual(warnings[0]["code"], "pressure_unavailable")
+
+    def test_redaction_hides_mount_source_and_warning_address(self):
+        snap = {
+            "hostname": "box",
+            "disk": [{"mount_source": "10.0.0.2:/home/private", "used_pct": 10}],
+            "listening": [{"address": "192.168.1.2:11434", "host": "192.168.1.2",
+                           "port": "11434", "scope": "lan", "process": "ollama(1)",
+                           "process_name": "ollama", "pid": 1, "agent_kind": "ollama"}],
+        }
+        agentbox.redact_snapshot(snap)
+        warnings = agentbox.collect_warnings(snap)
+        blob = json.dumps({"snapshot": snap, "warnings": warnings})
+        self.assertNotIn("10.0.0.2", blob)
+        self.assertNotIn("192.168.1.2", blob)
+
+
+class TestReleaseTwoCollectors(unittest.TestCase):
+    def test_claude_usage_is_normalized_without_content(self):
+        record = {
+            "timestamp": "2026-08-17T12:00:00Z",
+            "message": {"usage": {
+                "input_tokens": 10, "output_tokens": 4,
+                "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2,
+            }, "content": "secret prompt"},
+        }
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "private-project")
+            os.makedirs(project)
+            path = os.path.join(project, "session.jsonl")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+            with mock.patch.object(agentbox.os.path, "expanduser", return_value=root), \
+                    mock.patch.object(agentbox, "run", return_value="Claude 2.1.233"):
+                result = agentbox.collect_claude(days=30, scrub=True)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["totals"]["input"], 10)
+        self.assertEqual(result["totals"]["cache_read"], 3)
+        self.assertNotIn("secret prompt", json.dumps(result))
+        self.assertTrue(result["projects"][0]["project_hash"].startswith("sha256:"))
+
+    def test_claude_unknown_schema_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "project"))
+            with open(os.path.join(root, "project", "session.jsonl"), "w") as fh:
+                fh.write('{"type":"system","content":"secret"}\n')
+            with mock.patch.object(agentbox.os.path, "expanduser", return_value=root):
+                result = agentbox.collect_claude()
+        self.assertFalse(result["available"])
+        self.assertIn("unsupported", result["reason"])
+
+    def test_ollama_list_and_redaction(self):
+        listing = ("NAME ID SIZE MODIFIED\n"
+                   "model:latest abc123 1.5 GB 2 hours ago\n")
+        running = "NAME ID SIZE PROCESSOR UNTIL\nmodel:latest abc123 1.5 GB 100% CPU 4 minutes\n"
+        def result(cmd, timeout=5):
+            if cmd[-1] == "list":
+                return listing, None
+            if cmd[-1] == "ps":
+                return running, None
+            return "", None
+        with mock.patch.object(agentbox, "run_result", side_effect=result), \
+                mock.patch.object(agentbox, "run", return_value="ollama version is 1"):
+            out = agentbox.collect_ollama(scrub=True)
+        self.assertTrue(out["available"])
+        self.assertEqual(out["models"][0]["size_bytes"], int(1.5 * 1024 ** 3))
+        self.assertTrue(out["running"][0]["name"].startswith("sha256:"))
+        self.assertIsNone(out["running"][0]["raw"])
+
+    def test_changes_uses_metadata_only(self):
+        def result(cmd, timeout=5):
+            if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                return "/tmp/repo\n", None
+            if cmd[1:3] == ["log", "-1"]:
+                return "a" * 40 + "\0subject\017123456789\n", None
+            if cmd[1] == "status":
+                return " M secret.py\n?? new.txt\n", None
+            if cmd[1:3] == ["diff", "HEAD"]:
+                return "2\t1\tsecret.py\n", None
+            return "", "unexpected"
+        with mock.patch.object(agentbox, "run_result", side_effect=result):
+            out = agentbox.collect_changes(scrub=True)
+        self.assertTrue(out["available"])
+        self.assertTrue(out["dirty"])
+        self.assertEqual(out["counts"]["modified"], 1)
+        self.assertIsNone(out["root"])
+        self.assertNotIn("secret.py", json.dumps(out))
 
 
 class TestStatusAndRendering(unittest.TestCase):

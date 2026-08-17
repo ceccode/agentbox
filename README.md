@@ -3,7 +3,7 @@
 One file. No dependencies. Tells you what your Linux AI box is doing.
 
 Built for a laptop running headless as an agent environment — opencode,
-llama.cpp, ollama — checked on over SSH. Text only, no GUI, no daemon.
+Claude Code, llama.cpp, ollama — checked on over SSH. Text only, no GUI, no daemon.
 
 ```
 $ agentbox
@@ -14,13 +14,17 @@ CPU   [########............]  42.0%  8 cores   load 6.04/3.85/2.68 (0.76x per co
       up 5d12h   57°C
 RAM   [########............]  41.0%  5.8G / 14.0G   (9.1G available)
 SWAP  [....................]   0.0%  728.0K / 4.0G
+PSI   cpu some 0.3%   memory full 0.0%   io full 0.1%  (avg10)
 GPU   [....................]   0.0%  NVIDIA GeForce MX250   57°C   5W/5W
 VRAM  [....................]   0.1%  2.0M / 2.0G
 DISK  [#...................]   6.0%  /  28.0G / 468.0G   (417.0G free)
+      ext4 on /dev/nvme0n1p2   inodes 1.0%   I/O 0B/s read 0B/s write
 
 TOP PROCESSES
   118.0%cpu   817.0M rss    44263  opencode
    47.0%cpu   793.0M rss    55634  opencode
+
+AGENTS  opencode 2   claude 1
 
 SERVICES  28 running
   ● ollama                 active
@@ -54,7 +58,7 @@ git clone https://github.com/ceccode/agentbox && cd agentbox
 
 ```bash
 agentbox                    # full snapshot
-agentbox cpu | mem | gpu | disk | services | procs | opencode
+agentbox cpu | mem | gpu | disk | services | procs | agents | pressure | opencode
 agentbox --json             # machine readable — this is the real interface
 agentbox --jsonl            # one compact JSON object per line, for logging
 agentbox --json opencode
@@ -62,11 +66,23 @@ agentbox --watch 5          # refresh every 5s (foreground loop, not a daemon)
 agentbox --days 30          # opencode token window
 agentbox --redact           # remove host, network, process and session identifiers
 agentbox --plain            # no Unicode decorations or terminal control sequences
+agentbox --check            # exit 1 when warnings are present
+agentbox --deep disk        # inspect known AI storage directories
+agentbox claude             # Claude Code local usage, when available
+agentbox ollama             # installed and running Ollama models
+agentbox changes             # current repository state, without diff content
 ```
 
 `--no-titles` remains an alias for `--redact`. Use `--jsonl --watch 5` for a
 machine-readable stream; `--json --watch` is rejected because concatenated
 formatted JSON is not a valid stream.
+
+`--check` maps the same warning contract used by JSON to process exit codes:
+`0` means healthy, `1` means warnings, and argparse/configuration errors use `2`.
+
+`--deep disk` scans known AI storage roots (`~/.ollama`, `~/.claude`, opencode,
+Hugging Face, llama.cpp and Docker) with bounded `du` scans. It is opt-in and
+does not follow other filesystems.
 
 Edit `WATCHED_UNITS` at the top of the file for your machine.
 
@@ -100,6 +116,13 @@ No MCP server, no subagent, no daemon.
   cloud providers. Use `ccusage` or `tokscale` for real spend accounting.
 - `--redact` strips host, network, process and session identifiers. Use it for
   anything public or logged: `agentbox --jsonl --redact >> metrics.jsonl`.
+- PSI comes from `/proc/pressure`; disk metadata comes from mountinfo, statvfs
+  and diskstats. No elevated privileges or extra dependencies are required.
+- Claude Code usage is parsed locally from JSONL usage fields only; prompts,
+  tool output and project paths are never returned. Its local format is
+  best-effort and cost is deliberately not estimated.
+- `ollama` uses `ollama list` and `ollama ps`; `changes` reports only repository
+  metadata and numstat, never diff content.
 
 ## Tests
 

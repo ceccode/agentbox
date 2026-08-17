@@ -113,7 +113,8 @@ class TestSkillMatchesCLI(unittest.TestCase):
         parser = agentbox.build_parser()
         for flag in sorted(documented_flags(self.text)):
             with self.subTest(flag=flag):
-                boolean = {"--json", "--jsonl", "--no-titles", "--plain", "--redact"}
+                boolean = {"--check", "--deep", "--json", "--jsonl", "--no-titles",
+                           "--plain", "--redact"}
                 argv = [flag] if flag in boolean else [flag, "5"]
                 parser.parse_args(argv)
 
