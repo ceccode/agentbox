@@ -76,12 +76,22 @@ agentbox capacity            # deterministic readiness checks
 agentbox explain             # explanations and suggested actions for warnings
 ```
 
+The JSON contract is versioned with the top-level `schema_version` field.
+Current value: `1`. Consumers should read `status` and `warnings` before using
+section data, and should treat `available: false`, `partial`, `unknown`, and
+`data_confidence: "unverified"` as non-healthy data states.
+
 `--no-titles` remains an alias for `--redact`. Use `--jsonl --watch 5` for a
 machine-readable stream; `--json --watch` is rejected because concatenated
 formatted JSON is not a valid stream.
 
 `--check` maps the same warning contract used by JSON to process exit codes:
-`0` means healthy, `1` means warnings, and argparse/configuration errors use `2`.
+`0` means healthy, `1` means warnings (including `config_invalid`), and
+argparse errors use `2`.
+
+`capacity` propagates blocked and unknown resource checks into the same warning
+contract, so `agentbox --check capacity` is safe to use in CI or before starting
+another agent.
 
 `--deep disk` scans known AI storage roots (`~/.ollama`, `~/.claude`, opencode,
 Hugging Face, llama.cpp and Docker) with bounded `du` scans. It is opt-in and
@@ -129,12 +139,28 @@ No MCP server, no subagent, no daemon.
 - `usage` compares today with the observed window and optional daily budgets.
   `capacity` is deterministic and does not claim that a specific model will fit.
   `explain` uses static explanations, never an embedded LLM.
+- Configuration is optional at `~/.config/agentbox/config.json`. Invalid values
+  produce `config_invalid` instead of silently disabling a threshold:
+
+  ```json
+  {
+    "disk_warning_pct": 85,
+    "inode_warning_pct": 85,
+    "usage": {
+      "opencode_daily_tokens": 500000,
+      "claude_daily_tokens": 300000
+    }
+  }
+  ```
 
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+Prompt examples for testing the shared opencode and Claude Code skill are in
+[`docs/test-prompts.md`](docs/test-prompts.md).
 
 Two kinds of drift are caught here rather than in the field:
 

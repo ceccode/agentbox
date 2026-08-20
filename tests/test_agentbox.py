@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -420,6 +421,27 @@ class TestReleaseTwoCollectors(unittest.TestCase):
         self.assertTrue(out["running"][0]["name"].startswith("sha256:"))
         self.assertIsNone(out["running"][0]["raw"])
 
+    def test_ollama_malformed_rows_are_partial(self):
+        listing = "NAME ID SIZE MODIFIED\nmodel:latest id 1.0 GB yesterday\ninvalid row\n"
+        with mock.patch.object(agentbox, "run_result", side_effect=[
+                (listing, None),
+                ("NAME ID SIZE PROCESSOR UNTIL\n", None)]), \
+                mock.patch.object(agentbox, "run", return_value="ollama version is 1"):
+            out = agentbox.collect_ollama()
+        self.assertTrue(out["available"])
+        self.assertTrue(out["partial"])
+        self.assertIn("rows", out["reason"])
+
+    def test_ollama_ps_malformed_rows_are_partial(self):
+        listing = "NAME ID SIZE MODIFIED\nmodel:latest id 1.0 GB yesterday\n"
+        running = "NAME ID SIZE PROCESSOR CONTEXT UNTIL\nnot-a-model x y z\n"
+        with mock.patch.object(agentbox, "run_result", side_effect=[
+                (listing, None), (running, None)]), \
+                mock.patch.object(agentbox, "run", return_value="ollama version is 1"):
+            out = agentbox.collect_ollama()
+        self.assertTrue(out["partial"])
+        self.assertEqual(out["running"], [])
+
     def test_changes_uses_metadata_only(self):
         def result(cmd, timeout=5):
             if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
@@ -442,10 +464,11 @@ class TestReleaseTwoCollectors(unittest.TestCase):
 
 class TestReleaseThreeCollectors(unittest.TestCase):
     def test_usage_trend_and_budget(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         snap = {
             "claude": {"available": True, "window_days": 7,
                        "totals": {"input": 10, "output": 5},
-                       "tokens_by_day": {"2026-08-17": 15}},
+                       "tokens_by_day": {today: 15}},
         }
         usage = agentbox.collect_usage(snap, {"usage": {"claude_daily_tokens": 10}})
         self.assertEqual(usage["providers"]["claude"]["today_tokens"], 15)
@@ -490,6 +513,17 @@ class TestReleaseThreeCollectors(unittest.TestCase):
         })
         self.assertIsNone(usage["providers"]["opencode"]["today_tokens"])
 
+    def test_capacity_ignores_residual_psi_when_unavailable(self):
+        capacity = agentbox.collect_capacity({
+            "pressure": {"available": False, "io": {"full": {"avg10": 0}}},
+        })
+        self.assertEqual(capacity["checks"][-1]["status"], "unknown")
+
+    def test_opencode_without_version_is_unverified(self):
+        snap = {"opencode": {"available": True, "data_confidence": "unverified",
+                             "version": None, "tested_version": "1.18.18"}}
+        self.assertEqual(agentbox.collect_warnings(snap)[0]["code"], "opencode_version")
+
     def test_invalid_config_is_reported(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "config.json")
@@ -499,6 +533,45 @@ class TestReleaseThreeCollectors(unittest.TestCase):
                 config, error = agentbox.load_config()
         self.assertEqual(config, {})
         self.assertIn("cannot read config", error)
+
+    def test_invalid_config_numbers_are_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"disk_warning_pct": float("nan"),
+                           "capacity_min_ram_bytes": 1.5}, fh, allow_nan=True)
+            with mock.patch.object(agentbox.os.path, "expanduser", return_value=path):
+                config, error = agentbox.load_config()
+        self.assertIn("disk_warning_pct", error)
+        self.assertIn("capacity_min_ram_bytes", error)
+        self.assertNotIn("capacity_min_ram_bytes", config)
+
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"capacity_min_ram_bytes": True}, fh)
+            with mock.patch.object(agentbox.os.path, "expanduser", return_value=path):
+                config, error = agentbox.load_config()
+        self.assertNotIn("capacity_min_ram_bytes", config)
+        self.assertIn("capacity_min_ram_bytes", error)
+
+    def test_capacity_block_is_part_of_snapshot_warnings(self):
+        with mock.patch.object(agentbox, "collect_cpu_and_procs", return_value={
+                "usage_pct": 1, "cores": 1, "load": [0, 0, 0], "load_per_core": 0,
+                "uptime_seconds": 1, "temp_c": None, "top": []}), \
+                mock.patch.object(agentbox, "collect_mem", return_value={
+                    "total_bytes": 1, "available_bytes": 1, "used_bytes": 0,
+                    "used_pct": 0, "cached_bytes": 0, "swap_total_bytes": 0,
+                    "swap_used_bytes": 0, "swap_used_pct": 0}), \
+                mock.patch.object(agentbox, "collect_disk", return_value=[{
+                    "path": "/", "total_bytes": 1, "free_bytes": 1, "used_bytes": 0,
+                    "used_pct": 0, "inode_used_pct": 0, "read_only": False}]), \
+                mock.patch.object(agentbox, "collect_pressure", return_value={
+                    "available": True, "cpu": {}, "memory": {}, "io": {}}):
+            snap = agentbox.snapshot(sections={"capacity"})
+        self.assertEqual(snap["capacity"]["status"], "blocked")
+        self.assertIn("capacity_blocked", {w["code"] for w in snap["warnings"]})
+        self.assertEqual(snap["schema_version"], 1)
 
 
 class TestStatusAndRendering(unittest.TestCase):
@@ -521,7 +594,10 @@ class TestStatusAndRendering(unittest.TestCase):
                 "db_path": "/home/user/opencode.db",
                 "live_processes": [{"pid": 123, "tty": "pts/1", "cmdline": "/secret"}],
                 "sessions": [{"id": "ses_secret", "parent_id": "ses_parent",
-                              "title": "secret title", "directory": "/secret/project"}],
+                              "title": "secret title", "directory": "/secret/project",
+                              "model": "private-provider/private-model",
+                              "models": ["private-provider/private-model"]}],
+                "tokens_by_model": {"private-provider/private-model": {"input": 1}},
                 "todos": [{"session_id": "ses_secret", "content": "secret todo"}],
             },
         }
@@ -529,7 +605,8 @@ class TestStatusAndRendering(unittest.TestCase):
         blob = json.dumps(snap)
         for secret in ("private-host", "10.0.0.1", "ses_secret", "ses_parent",
                        "/home/user", "pts/1", "/secret", "secret title", "secret todo",
-                       "secret-worker", "server(123)", "python"):
+                       "secret-worker", "server(123)", "python", "private-provider",
+                       "private-model"):
             self.assertNotIn(secret, blob)
         self.assertEqual(snap["listening"][0]["address"], "*:8080")
 

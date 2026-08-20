@@ -15,6 +15,11 @@ interface — parse it. Never read `/proc`, run `nvidia-smi`, `free`, `top`, or
 `systemctl` by hand to answer these questions; agentbox already did it, more
 carefully, in one pass.
 
+The top-level JSON `schema_version` is currently `1`. Read `status` and
+`warnings` before trusting any collector; `available: false`, `partial`,
+`unknown`, or `data_confidence: "unverified"` must not be treated as healthy
+zero values.
+
 ```bash
 agentbox --json                 # everything
 agentbox --json opencode        # just token accounting

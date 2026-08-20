@@ -449,6 +449,7 @@ DEEP_STORAGE_ROOTS = (
     ("docker", "/var/lib/docker"),
 )
 CONFIG_PATH = "~/.config/agentbox/config.json"
+JSON_SCHEMA_VERSION = 1
 
 
 def load_config() -> tuple[dict, str | None]:
@@ -462,7 +463,55 @@ def load_config() -> tuple[dict, str | None]:
         return {}, "cannot read config"
     if not isinstance(value, dict):
         return {}, "config must contain a JSON object"
-    return value, None
+    sanitized = dict(value)
+    errors = []
+    for key in ("disk_warning_pct", "inode_warning_pct"):
+        if key in value:
+            try:
+                if isinstance(value[key], bool):
+                    raise ValueError
+                number = float(value[key])
+                if not math.isfinite(number) or not 0 <= number <= 100:
+                    errors.append(f"{key} must be between 0 and 100")
+                    sanitized.pop(key, None)
+            except (TypeError, ValueError, OverflowError):
+                errors.append(f"{key} must be numeric")
+                sanitized.pop(key, None)
+    for key in ("capacity_min_ram_bytes", "capacity_min_disk_bytes"):
+        if key in value:
+            try:
+                if isinstance(value[key], bool):
+                    raise ValueError
+                number = float(value[key])
+                if not math.isfinite(number) or number <= 0 or not number.is_integer():
+                    errors.append(f"{key} must be positive")
+                    sanitized.pop(key, None)
+            except (TypeError, ValueError, OverflowError):
+                errors.append(f"{key} must be a positive integer")
+                sanitized.pop(key, None)
+    usage = value.get("usage", {})
+    if usage is not None and not isinstance(usage, dict):
+        errors.append("usage must be an object")
+        sanitized.pop("usage", None)
+    elif isinstance(usage, dict):
+        sanitized_usage = dict(usage)
+        for key, item in usage.items():
+            if not key.endswith("_daily_tokens"):
+                errors.append(f"unknown usage key: {key}")
+                sanitized_usage.pop(key, None)
+            else:
+                try:
+                    if isinstance(item, bool):
+                        raise ValueError
+                    number = float(item)
+                    if not math.isfinite(number) or number <= 0 or not number.is_integer():
+                        errors.append(f"{key} must be a positive integer")
+                        sanitized_usage.pop(key, None)
+                except (TypeError, ValueError, OverflowError):
+                    errors.append(f"{key} must be a positive integer")
+                    sanitized_usage.pop(key, None)
+        sanitized["usage"] = sanitized_usage
+    return sanitized, "; ".join(errors) or None
 
 
 def _daily_budget(config: dict, provider: str) -> int | None:
@@ -963,14 +1012,17 @@ def _parse_ollama_table(output: str) -> list[list[str]]:
 
 def collect_ollama(scrub: bool = False) -> dict:
     out = {"available": False, "reason": None, "source": "ollama_cli",
-           "version": None, "models": [], "running": []}
+           "version": None, "models": [], "running": [], "partial": False}
     version = run(["ollama", "--version"]).strip()
     out["version"] = version or None
     listing, list_error = run_result(["ollama", "list"])
     if list_error:
         out["reason"] = list_error
         return out
-    for row in _parse_ollama_table(listing):
+    data_lines = [line for line in listing.splitlines()[1:] if line.strip()]
+    parsed_rows = _parse_ollama_table(listing)
+    valid_model_rows = 0
+    for row in parsed_rows:
         if len(row) < 5:
             continue
         name, model_id = row[0], row[1]
@@ -978,21 +1030,40 @@ def collect_ollama(scrub: bool = False) -> dict:
         size_bytes = _ollama_size(size_text)
         if size_bytes is None:
             continue
+        valid_model_rows += 1
         item = {"name": name, "id": model_id, "size_bytes": size_bytes,
                 "modified": " ".join(row[4:])}
         if scrub:
             item["name"] = f"sha256:{_path_hash(name)}"
             item["id"] = None
         out["models"].append(item)
+    if data_lines and not valid_model_rows:
+        out["reason"] = "Ollama list schema unsupported"
+        return out
+    if valid_model_rows != len(data_lines):
+        out["partial"] = True
+        out["reason"] = "some Ollama list rows could not be parsed"
     running, running_error = run_result(["ollama", "ps"])
-    if not running_error:
-        for row in _parse_ollama_table(running):
+    if running_error:
+        out["partial"] = True
+        out["reason"] = f"ollama ps unavailable: {running_error}"
+    else:
+        running_lines = [line for line in running.splitlines()[1:] if line.strip()]
+        running_rows = _parse_ollama_table(running)
+        valid_running_rows = []
+        for row in running_rows:
+            if len(row) < 6 or _ollama_size(" ".join(row[2:4])) is None:
+                continue
+            valid_running_rows.append(row)
             name = row[0]
             out["running"].append({
                 "name": f"sha256:{_path_hash(name)}" if scrub else name,
                 "id": None if scrub else (row[1] if len(row) > 1 else None),
                 "raw": None if scrub else " ".join(row[2:]),
             })
+        if len(valid_running_rows) != len(running_lines):
+            out["partial"] = True
+            out["reason"] = out["reason"] or "some Ollama process rows could not be parsed"
     out["available"] = True
     return out
 
@@ -1067,6 +1138,7 @@ def collect_opencode(days: int = 7, scrub: bool = False,
         "db_path": None,
         "version": None,   # filled from session.version below - no subprocess
         "tested_version": TESTED_OPENCODE_VERSION,
+        "data_confidence": "unverified",
         "window_days": days,
         "live_processes": (_agent_processes(scrub) if live_processes is None
                            else live_processes),
@@ -1118,6 +1190,8 @@ def collect_opencode(days: int = 7, scrub: bool = False,
                           "ORDER BY time_updated DESC LIMIT 1").fetchone()
         if row and row["version"]:
             out["version"] = row["version"]
+            if out["version"] == TESTED_OPENCODE_VERSION:
+                out["data_confidence"] = "verified"
 
         # ---- sessions -------------------------------------------------- #
         sessions: dict[str, dict] = {}
@@ -1317,9 +1391,13 @@ def collect_warnings(snap: dict, config: dict | None = None) -> list[dict]:
     if oc := snap.get("opencode"):
         if not oc.get("available"):
             add("opencode_unavailable", f"opencode data unavailable: {oc.get('reason')}")
-        elif oc.get("version") and oc["version"] != oc["tested_version"]:
-            add("opencode_version", f"opencode {oc['version']} differs from tested "
-                f"{oc['tested_version']}")
+        elif oc.get("data_confidence") != "verified":
+            if oc.get("version"):
+                message = (f"opencode {oc['version']} differs from tested "
+                           f"{oc['tested_version']}")
+            else:
+                message = "opencode version unavailable; token data is unverified"
+            add("opencode_version", message)
     for name in ("claude", "ollama"):
         if provider := snap.get(name):
             if not provider.get("available"):
@@ -1385,7 +1463,8 @@ def collect_capacity(snap: dict, config: dict | None = None) -> dict:
     else:
         checks.append({"name": "disk", "status": "unknown", "message": "data unavailable"})
     pressure = snap.get("pressure")
-    io_value = (pressure or {}).get("io") if pressure else None
+    io_value = ((pressure or {}).get("io")
+                if pressure and pressure.get("available", True) else None)
     io10 = (io_value or {}).get("full", {}).get("avg10")
     checks.append({"name": "io", "status": ("unknown" if io10 is None else
                                                "warning" if io10 >= 10 else "ready"),
@@ -1456,6 +1535,16 @@ def redact_snapshot(snap: dict) -> None:
                 item["path"] = None
     if oc := snap.get("opencode"):
         oc["db_path"] = None
+        for session in oc.get("sessions", []):
+            if session.get("model"):
+                session["model"] = f"sha256:{_path_hash(session['model'])}"
+            session["models"] = [f"sha256:{_path_hash(model)}"
+                                 for model in session.get("models", [])]
+        if oc.get("tokens_by_model"):
+            oc["tokens_by_model"] = {
+                f"sha256:{_path_hash(label)}": tokens
+                for label, tokens in oc["tokens_by_model"].items()
+            }
         for proc in oc.get("live_processes", []):
             proc["pid"] = None
             proc["tty"] = None
@@ -1504,6 +1593,7 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
                  "agents", "opencode", "claude", "ollama"}
     config, config_error = load_config()
     snap = {
+        "schema_version": JSON_SCHEMA_VERSION,
         "hostname": os.uname().nodename,
         "kernel": os.uname().release,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1548,6 +1638,16 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
         snap["warnings"].extend(usage["warnings"])
     if "capacity" in want:
         snap["capacity"] = collect_capacity(snap, config)
+        if snap["capacity"]["status"] == "blocked":
+            snap["warnings"].append({
+                "code": "capacity_blocked",
+                "message": "capacity check is blocked by a hard resource limit",
+            })
+        elif snap["capacity"]["status"] == "warning":
+            snap["warnings"].append({
+                "code": "capacity_unknown",
+                "message": "capacity check has unavailable or contended data",
+            })
     if "explain" in want:
         snap["explain"] = collect_explain(snap["warnings"])
     snap["status"] = "WARNING" if snap["warnings"] else "OK"
