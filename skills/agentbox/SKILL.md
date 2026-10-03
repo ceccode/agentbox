@@ -1,12 +1,14 @@
 ---
 name: agentbox
-description: Inspect this Linux machine's health, AI agent processes, and opencode token usage. Use whenever asked how the box is doing, whether it's overloaded, how much RAM/disk/GPU is left, what's eating CPU, whether opencode or Claude Code is running, which services are up, how many tokens opencode burned, or which sessions ran recently. Also use before starting heavy work to check there is headroom.
+description: Inspect this Linux or macOS machine's health, AI agent processes, and local provider usage. Use whenever asked how the box is doing, whether it's overloaded, how much RAM/disk/GPU is left, what's eating CPU, whether opencode or Claude Code is running, which services are up, how many tokens opencode burned, or which sessions ran recently. Also use before starting heavy work to check there is headroom.
 ---
 
 # agentbox
 
-`agentbox` is a single-file probe for this machine. It reads `/proc`, sysfs,
-`nvidia-smi`, `systemctl`, and opencode's SQLite DB, and prints one snapshot.
+`agentbox` is a single-file probe for this machine. On Linux it reads `/proc`,
+sysfs, `nvidia-smi`, `systemctl`, and provider files. On macOS it uses `top`,
+`ps`, `sysctl`, `vm_stat`, `statvfs`, `mount`, `lsof` when present, and the
+same provider files. It prints one snapshot.
 
 ## Rule: always use `--json`
 
@@ -16,9 +18,10 @@ interface — parse it. Never read `/proc`, run `nvidia-smi`, `free`, `top`, or
 carefully, in one pass.
 
 The top-level JSON `schema_version` is currently `1`. Read `status` and
-`warnings` before trusting any collector; `available: false`, `partial`,
-`unknown`, or `data_confidence: "unverified"` must not be treated as healthy
-zero values.
+`warnings` before trusting any collector; `available: false`,
+`availability: "partial"`, `unknown`, or `data_confidence: "unverified"` must
+not be treated as healthy zero values. `availability: "unsupported"` means the
+platform does not expose that feature, not that the machine is unhealthy.
 
 ```bash
 agentbox --json                 # everything
@@ -38,8 +41,8 @@ Pass one positional section to narrow the snapshot:
 | `cpu`, `procs` | usage, load, per-core load, uptime, temp, top processes |
 | `mem`, `ram` | RAM + swap |
 | `gpu` | NVIDIA (via `nvidia-smi`) or AMD (via sysfs) |
-| `disk` | capacity, filesystem, inode and I/O data for `/` and `/home` |
-| `pressure`, `psi` | Linux CPU, memory and I/O pressure |
+| `disk` | capacity, filesystem, inode and I/O data for operational mounts |
+| `pressure`, `psi` | Linux CPU, memory and I/O pressure; unsupported on macOS |
 | `agents` | live opencode, Claude Code, Ollama and llama.cpp processes |
 | `claude` | local Claude Code token usage by hashed project |
 | `ollama` | installed and running Ollama models |
@@ -80,8 +83,10 @@ Report in plain language, then flag anything concerning:
   tell a burst from a trend.
 - **RAM** — judge by `available_bytes`, not cache or free memory. Swap in use
   with low available RAM is real pressure.
-- **Pressure** — read PSI `avg10` for current contention. `full` means all
-  runnable work was stalled; the top-level warnings apply conservative limits.
+- **Pressure** — on Linux, read PSI `avg10` for current contention. `full`
+  means all runnable work was stalled; the top-level warnings apply conservative
+  limits. On macOS this section is unsupported and should not be converted into
+  a fake PSI value.
 - **Disk** — over 85% space or inode use is worth raising unprompted. A
   read-only operational mount is also a warning.
 - **Network** — agent listeners on wildcard, LAN or external addresses are
@@ -97,7 +102,8 @@ Report in plain language, then flag anything concerning:
 - **Usage** — compare provider values separately. A budget warning concerns
   observed tokens, not provider billing or subscription spend.
 - **Capacity** — treat `blocked` as a hard resource constraint and `warning` as
-  contention; it is not a model-fit predictor.
+  contention or unknown required data. `not_applicable` checks are platform
+  limits. Capacity is not a model-fit predictor.
 - **Explain** — relay the static meaning and suggestion, but keep the original
   warning message as the source of truth.
 - **GPU** — temperatures at or above 85 C deserve attention. Do not claim
@@ -109,8 +115,9 @@ Report in plain language, then flag anything concerning:
 
 It carries a `reason`. The schema is pinned to a tested opencode version and
 degrades deliberately instead of guessing — so an upgrade that moved the schema
-reports unavailable rather than a wrong number. Relay the reason; do not try to
-query the DB yourself to work around it.
+reports unavailable rather than a wrong number. If corrupt or duplicate records
+were found, the section is `partial` and includes parse counters. Relay the
+reason; do not try to query the DB yourself to work around it.
 
 ## Installing it elsewhere
 

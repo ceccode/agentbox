@@ -43,6 +43,16 @@ WATCHED_UNITS = [
 ]
 
 SAMPLE_INTERVAL = 0.4  # seconds, for CPU delta sampling
+JSON_SCHEMA_VERSION = 1
+
+AVAILABILITY_AVAILABLE = "available"
+AVAILABILITY_UNSUPPORTED = "unsupported"
+AVAILABILITY_UNAVAILABLE = "unavailable"
+AVAILABILITY_PARTIAL = "partial"
+AVAILABILITY_UNVERIFIED = "unverified"
+
+CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 # --------------------------------------------------------------------------- #
@@ -89,11 +99,18 @@ def run(cmd: list[str], timeout: int = 5) -> str:
 
 def run_result(cmd: list[str], timeout: int = 5) -> tuple[str, str | None]:
     """Run a command and preserve why its output may be unavailable."""
-    if not shutil.which(cmd[0]):
+    exe = shutil.which(cmd[0])
+    if not exe:
+        for prefix in ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/opt/homebrew/bin"):
+            candidate = os.path.join(prefix, cmd[0])
+            if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                exe = candidate
+                break
+    if not exe:
         return "", f"{cmd[0]} not found"
     try:
         out = subprocess.run(
-            cmd, capture_output=True, text=True, errors="replace",
+            [exe, *cmd[1:]], capture_output=True, text=True, errors="replace",
             timeout=timeout, check=False
         )
         if out.returncode:
@@ -112,6 +129,49 @@ def read(path: str) -> str:
             return fh.read()
     except OSError:
         return ""
+
+
+def _platform_id() -> str:
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "macos"
+    return sys.platform
+
+
+def platform_info() -> dict:
+    system = _platform_id()
+    return {
+        "system": system,
+        "sys_platform": sys.platform,
+        "machine": os.uname().machine,
+        "release": os.uname().release,
+        "capabilities": {
+            "procfs": system == "linux" and os.path.isdir("/proc"),
+            "pressure": system == "linux" and os.path.isdir("/proc/pressure"),
+            "systemd": system == "linux" and shutil.which("systemctl") is not None,
+            "macos_vm_stat": system == "macos" and shutil.which("vm_stat") is not None,
+            "macos_lsof": system == "macos" and shutil.which("lsof") is not None,
+        },
+    }
+
+
+def unavailable(reason: str, availability: str = AVAILABILITY_UNAVAILABLE,
+                source: str | None = None) -> dict:
+    out = {"available": False, "availability": availability, "reason": reason}
+    if source:
+        out["source"] = source
+    return out
+
+
+def is_unsupported(section: dict | None) -> bool:
+    return bool(section and section.get("availability") == AVAILABILITY_UNSUPPORTED)
+
+
+def clean_text(value: object) -> str:
+    text = str(value)
+    text = ANSI_CSI.sub("", text)
+    return CONTROL_CHARS.sub("", text)
 
 
 # --------------------------------------------------------------------------- #
@@ -141,6 +201,11 @@ def _parse_pressure(text: str) -> dict | None:
 
 
 def collect_pressure(resources=("cpu", "memory", "io")) -> dict:
+    if _platform_id() != "linux":
+        out = unavailable("pressure stall information is Linux-only",
+                          AVAILABILITY_UNSUPPORTED, "procfs")
+        out.update({"cpu": None, "memory": None, "io": None})
+        return out
     out = {"available": True, "reason": None}
     errors = []
     for resource in resources:
@@ -188,7 +253,7 @@ def _proc_times() -> dict[int, tuple[int, str]]:
     return out
 
 
-def collect_cpu_and_procs(top_n: int = 6) -> dict:
+def collect_linux_cpu_and_procs(top_n: int = 6) -> dict:
     """Sample CPU + per-process usage over SAMPLE_INTERVAL for real numbers."""
     ncpu = os.cpu_count() or 1
     hz = os.sysconf("SC_CLK_TCK")
@@ -234,6 +299,125 @@ def collect_cpu_and_procs(top_n: int = 6) -> dict:
     }
 
 
+def _sysctl_int(name: str) -> int | None:
+    out, error = run_result(["sysctl", "-n", name])
+    if error:
+        return None
+    try:
+        return int(out.strip())
+    except ValueError:
+        return None
+
+
+def _macos_cpu_usage(interval: float = SAMPLE_INTERVAL) -> tuple[float | None, str | None, float]:
+    start = time.monotonic()
+    out, error = run_result(["top", "-l", "2", "-s", str(interval), "-n", "0"], timeout=5)
+    elapsed = max(0.001, time.monotonic() - start)
+    if error and not out:
+        ps_out, ps_error = run_result(["ps", "-A", "-o", "%cpu="])
+        if ps_error:
+            return None, error, elapsed
+        total = 0.0
+        for line in ps_out.splitlines():
+            try:
+                total += float(line.strip())
+            except ValueError:
+                continue
+        cores = os.cpu_count() or 1
+        return round(max(0.0, min(100.0, total / cores)), 1), (
+            f"{error}; fell back to ps %cpu"), elapsed
+    matches = re.findall(r"CPU usage:\s+.*?([0-9.]+)% idle", out)
+    if not matches:
+        return None, "top CPU output schema unsupported", elapsed
+    idle = float(matches[-1])
+    return round(max(0.0, min(100.0, 100.0 - idle)), 1), None, elapsed
+
+
+def _macos_top_processes(top_n: int = 6) -> list[dict]:
+    out, error = run_result(["ps", "-axo", "pid=,pcpu=,rss=,comm="])
+    if error:
+        return []
+    procs = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            cpu_pct = float(parts[1])
+            rss = int(parts[2]) * 1024
+        except ValueError:
+            continue
+        if cpu_pct <= 0.5:
+            continue
+        procs.append({
+            "pid": pid,
+            "name": os.path.basename(parts[3]),
+            "cpu_pct": round(cpu_pct, 1),
+            "rss_bytes": rss,
+            "cmdline": parts[3][:120],
+        })
+    procs.sort(key=lambda p: p["cpu_pct"], reverse=True)
+    return procs[:top_n]
+
+
+def collect_macos_cpu_and_procs(top_n: int = 6) -> dict:
+    ncpu = _sysctl_int("hw.ncpu") or os.cpu_count() or 1
+    usage_pct, reason, elapsed = _macos_cpu_usage()
+    load1, load5, load15 = os.getloadavg()
+    boot = _sysctl_int("kern.boottime")
+    uptime = None
+    if boot is None:
+        out, _ = run_result(["sysctl", "-n", "kern.boottime"])
+        m = re.search(r"sec\s*=\s*(\d+)", out)
+        boot = int(m.group(1)) if m else None
+    if boot:
+        uptime = max(0, int(time.time() - boot))
+    result = {
+        "available": usage_pct is not None,
+        "availability": (AVAILABILITY_AVAILABLE if usage_pct is not None and not reason
+                         else AVAILABILITY_UNVERIFIED if usage_pct is not None
+                         else AVAILABILITY_UNAVAILABLE),
+        "reason": reason,
+        "source": "top+ps+sysctl",
+        "sample_seconds": round(elapsed, 3),
+        "cores": ncpu,
+        "usage_pct": usage_pct if usage_pct is not None else 0.0,
+        "load": [round(load1, 2), round(load5, 2), round(load15, 2)],
+        "load_per_core": round(load1 / ncpu, 2),
+        "uptime_seconds": uptime or 0,
+        "temp_c": None,
+        "top": _macos_top_processes(top_n),
+    }
+    return result
+
+
+def collect_cpu_and_procs(top_n: int = 6) -> dict:
+    if _platform_id() == "macos":
+        return collect_macos_cpu_and_procs(top_n)
+    if _platform_id() != "linux" or not os.path.isdir("/proc"):
+        out = unavailable("CPU collector unsupported on this platform",
+                          AVAILABILITY_UNSUPPORTED)
+        out.update({"cores": os.cpu_count() or 1, "usage_pct": 0.0,
+                    "load": [0, 0, 0], "load_per_core": 0,
+                    "uptime_seconds": 0, "temp_c": None, "top": []})
+        return out
+    try:
+        result = collect_linux_cpu_and_procs(top_n)
+        result.setdefault("available", True)
+        result.setdefault("availability", AVAILABILITY_AVAILABLE)
+        result.setdefault("reason", None)
+        result.setdefault("source", "procfs")
+        result.setdefault("sample_seconds", SAMPLE_INTERVAL)
+        return result
+    except (OSError, ValueError, IndexError) as exc:
+        out = unavailable(f"CPU data unavailable: {exc}", source="procfs")
+        out.update({"cores": os.cpu_count() or 1, "usage_pct": 0.0,
+                    "load": [0, 0, 0], "load_per_core": 0,
+                    "uptime_seconds": 0, "temp_c": None, "top": []})
+        return out
+
+
 def _cpu_temp() -> float | None:
     best = None
     for zone in glob.glob("/sys/class/thermal/thermal_zone*"):
@@ -245,7 +429,7 @@ def _cpu_temp() -> float | None:
     return round(best, 1) if best else None
 
 
-def collect_mem() -> dict:
+def collect_linux_mem() -> dict:
     info = {}
     for line in read("/proc/meminfo").splitlines():
         k, _, v = line.partition(":")
@@ -270,7 +454,104 @@ def collect_mem() -> dict:
     }
 
 
+def _parse_vm_stat(text: str) -> tuple[int | None, dict[str, int]]:
+    first = text.splitlines()[0] if text.splitlines() else ""
+    m = re.search(r"page size of (\d+) bytes", first)
+    page_size = int(m.group(1)) if m else None
+    pages = {}
+    for line in text.splitlines()[1:]:
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        raw = value.strip().rstrip(".")
+        try:
+            pages[key.strip()] = int(raw)
+        except ValueError:
+            continue
+    return page_size, pages
+
+
+def collect_macos_mem() -> dict:
+    total = _sysctl_int("hw.memsize") or 0
+    text, error = run_result(["vm_stat"])
+    page_size, pages = _parse_vm_stat(text)
+    if not total and page_size:
+        try:
+            total = os.sysconf("SC_PHYS_PAGES") * page_size
+        except (ValueError, OSError, AttributeError):
+            total = 0
+    if error or not page_size or not pages:
+        out = unavailable(error or "vm_stat output schema unsupported", source="vm_stat")
+        out.update({
+            "total_bytes": total, "used_bytes": 0, "available_bytes": 0,
+            "used_pct": 0.0, "cached_bytes": 0,
+            "swap_total_bytes": 0, "swap_used_bytes": 0, "swap_used_pct": 0.0,
+            "basis": "macos_vm_stat",
+        })
+        return out
+    free_pages = pages.get("Pages free", 0)
+    inactive_pages = pages.get("Pages inactive", 0)
+    speculative_pages = pages.get("Pages speculative", 0)
+    wired_pages = pages.get("Pages wired down", pages.get("Pages wired", 0))
+    compressed_pages = pages.get("Pages occupied by compressor", 0)
+    available = (free_pages + inactive_pages + speculative_pages) * page_size
+    used = max(0, total - available) if total else 0
+    cached = inactive_pages * page_size
+    swap_total = swap_used = 0
+    swap, _ = run_result(["sysctl", "-n", "vm.swapusage"])
+    numbers = re.findall(r"([0-9.]+)M", swap)
+    if len(numbers) >= 2:
+        try:
+            swap_total = int(float(numbers[0]) * 1024 ** 2)
+            swap_used = int(float(numbers[1]) * 1024 ** 2)
+        except ValueError:
+            pass
+    return {
+        "available": True,
+        "availability": AVAILABILITY_AVAILABLE,
+        "reason": None,
+        "source": "vm_stat+sysctl",
+        "basis": "free+inactive+speculative pages; not Linux MemAvailable",
+        "total_bytes": total,
+        "used_bytes": used,
+        "available_bytes": available,
+        "used_pct": round(100 * used / total, 1) if total else 0.0,
+        "cached_bytes": cached,
+        "wired_bytes": wired_pages * page_size,
+        "compressed_bytes": compressed_pages * page_size,
+        "swap_total_bytes": swap_total,
+        "swap_used_bytes": swap_used,
+        "swap_used_pct": round(100 * swap_used / swap_total, 1) if swap_total else 0.0,
+    }
+
+
+def collect_mem() -> dict:
+    if _platform_id() == "macos":
+        return collect_macos_mem()
+    if _platform_id() != "linux" or not os.path.exists("/proc/meminfo"):
+        out = unavailable("memory collector unsupported on this platform",
+                          AVAILABILITY_UNSUPPORTED)
+        out.update({"total_bytes": 0, "used_bytes": 0, "available_bytes": 0,
+                    "used_pct": 0.0, "cached_bytes": 0, "swap_total_bytes": 0,
+                    "swap_used_bytes": 0, "swap_used_pct": 0.0})
+        return out
+    result = collect_linux_mem()
+    if result["total_bytes"] <= 0:
+        result.update(unavailable("/proc/meminfo missing or unreadable", source="procfs"))
+    else:
+        result.setdefault("available", True)
+        result.setdefault("availability", AVAILABILITY_AVAILABLE)
+        result.setdefault("reason", None)
+        result.setdefault("source", "procfs")
+    return result
+
+
 def collect_gpu() -> dict:
+    if _platform_id() == "macos":
+        out = unavailable("Apple GPU telemetry is not implemented yet",
+                          AVAILABILITY_UNSUPPORTED, "macos")
+        out.update({"vendor": None, "gpus": [], "processes": []})
+        return out
     gpus: list[dict] = []
     vendor = None
 
@@ -361,7 +642,7 @@ def _parse_mountinfo(text: str) -> list[dict]:
 
 
 def _mount_for_path(path: str, mounts: list[dict]) -> dict | None:
-    path = os.path.realpath(path)
+    path = os.path.realpath(path) if os.path.exists(path) else os.path.abspath(path)
     matches = [m for m in mounts
                if path == m["mount_point"] or
                path.startswith(m["mount_point"].rstrip("/") + "/")]
@@ -382,8 +663,8 @@ def _diskstats() -> dict[str, tuple[int, int, int]]:
     return stats
 
 
-def collect_disk(paths=("/", "/home"), io_interval: float = 0.1,
-                 deep: bool = False) -> list[dict]:
+def collect_linux_disk(paths=("/", "/home"), io_interval: float = 0.1,
+                       deep: bool = False) -> list[dict]:
     mounts = _parse_mountinfo(read("/proc/self/mountinfo"))
     io0 = _diskstats() if io_interval else {}
     if io_interval:
@@ -418,6 +699,7 @@ def collect_disk(paths=("/", "/home"), io_interval: float = 0.1,
             "inode_used_pct": (round(100 * inode_used / inode_total, 1)
                                if inode_total else None),
             "read_only": bool(st.f_flag & getattr(os, "ST_RDONLY", 1)),
+            "operational": True,
             "filesystem": mount["filesystem"] if mount else None,
             "mount_source": mount["mount_source"] if mount else None,
             "mount_point": mount["mount_point"] if mount else None,
@@ -440,6 +722,101 @@ def collect_disk(paths=("/", "/home"), io_interval: float = 0.1,
     return out
 
 
+def _parse_macos_mounts(text: str) -> list[dict]:
+    mounts = []
+    pattern = re.compile(r"^(.*?) on (.*?) \((.*?)\)$")
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        source, mount_point, opts = match.groups()
+        options = [opt.strip() for opt in opts.split(",")]
+        filesystem = options[0] if options else None
+        mounts.append({
+            "device": None,
+            "root": "/",
+            "mount_point": mount_point,
+            "mount_options": options,
+            "filesystem": filesystem,
+            "mount_source": source,
+            "super_options": options,
+        })
+    return mounts
+
+
+def collect_macos_disk(paths: tuple[str, ...] | None = None,
+                       deep: bool = False) -> list[dict]:
+    if paths is None:
+        paths = (os.path.expanduser("~"),)
+    mounts = _parse_macos_mounts(run(["mount"]))
+    seen, out = set(), []
+    for p in paths:
+        p = os.path.abspath(os.path.expanduser(p))
+        if not os.path.isdir(p):
+            continue
+        try:
+            st = os.statvfs(p)
+            device = os.stat(p).st_dev
+        except OSError:
+            continue
+        mount = _mount_for_path(p, mounts)
+        if _platform_id() == "macos" and p.startswith("/Users/"):
+            data_mount = next((m for m in mounts
+                               if m.get("mount_point") == "/System/Volumes/Data"), None)
+            if data_mount:
+                mount = data_mount
+        key = (device, mount["mount_point"] if mount else p)
+        if key in seen:
+            continue
+        seen.add(key)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        inode_total = st.f_files
+        inode_used = max(0, inode_total - st.f_ffree)
+        options = mount["mount_options"] if mount else []
+        sealed_root = p == "/" and "sealed" in options and "read-only" in options
+        item = {
+            "available": True,
+            "availability": AVAILABILITY_AVAILABLE,
+            "reason": None,
+            "source": "statvfs+mount",
+            "path": p, "total_bytes": total, "used_bytes": total - free,
+            "free_bytes": free,
+            "used_pct": round(100 * (total - free) / total, 1) if total else 0.0,
+            "inode_total": inode_total,
+            "inode_used": inode_used,
+            "inode_free": st.f_ffree,
+            "inode_available": st.f_favail,
+            "inode_used_pct": (round(100 * inode_used / inode_total, 1)
+                               if inode_total else None),
+            "read_only": bool(st.f_flag & getattr(os, "ST_RDONLY", 1)) or "read-only" in options,
+            "operational": not sealed_root,
+            "filesystem": mount["filesystem"] if mount else None,
+            "mount_source": mount["mount_source"] if mount else None,
+            "mount_point": mount["mount_point"] if mount else p,
+            "mount_options": options,
+            "device": mount["device"] if mount else None,
+            "read_bytes_per_sec": None,
+            "write_bytes_per_sec": None,
+            "io_busy_pct": None,
+        }
+        out.append(item)
+    if deep and out:
+        out[0]["deep"] = collect_deep_storage()
+    return out
+
+
+def collect_disk(paths=None, io_interval: float = 0.1,
+                 deep: bool = False) -> list[dict]:
+    if _platform_id() == "macos":
+        return collect_macos_disk(paths, deep=deep)
+    if paths is None:
+        paths = ("/", "/home")
+    if _platform_id() != "linux" or not os.path.isdir("/proc"):
+        return []
+    return collect_linux_disk(paths=paths, io_interval=io_interval, deep=deep)
+
+
 DEEP_STORAGE_ROOTS = (
     ("ollama", "~/.ollama"),
     ("claude", "~/.claude"),
@@ -449,7 +826,6 @@ DEEP_STORAGE_ROOTS = (
     ("docker", "/var/lib/docker"),
 )
 CONFIG_PATH = "~/.config/agentbox/config.json"
-JSON_SCHEMA_VERSION = 1
 
 
 def load_config() -> tuple[dict, str | None]:
@@ -511,6 +887,26 @@ def load_config() -> tuple[dict, str | None]:
                     errors.append(f"{key} must be a positive integer")
                     sanitized_usage.pop(key, None)
         sanitized["usage"] = sanitized_usage
+    allowed_providers = {"opencode", "claude", "ollama"}
+    if "expected_providers" in value:
+        providers = value.get("expected_providers")
+        if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
+            errors.append("expected_providers must be a list of provider names")
+            sanitized.pop("expected_providers", None)
+        else:
+            unknown = sorted(set(providers) - allowed_providers)
+            if unknown:
+                errors.append(f"unknown expected provider: {', '.join(unknown)}")
+                sanitized.pop("expected_providers", None)
+            else:
+                sanitized["expected_providers"] = sorted(set(providers))
+    if "expected_services" in value:
+        services = value.get("expected_services")
+        if not isinstance(services, list) or not all(isinstance(s, str) and s for s in services):
+            errors.append("expected_services must be a list of service names")
+            sanitized.pop("expected_services", None)
+        else:
+            sanitized["expected_services"] = sorted(set(services))
     return sanitized, "; ".join(errors) or None
 
 
@@ -584,7 +980,7 @@ def collect_deep_storage(timeout: int = 15) -> dict:
     }
 
 
-def collect_services() -> dict:
+def collect_linux_services() -> dict:
     """Running systemd units + explicit status for the ones we care about."""
     running = []
     out, list_error = run_result(
@@ -631,6 +1027,24 @@ def collect_services() -> dict:
             "watched": watched, "failed": failed}
 
 
+def collect_services() -> dict:
+    if _platform_id() != "linux":
+        return {
+            "available": False,
+            "availability": AVAILABILITY_UNSUPPORTED,
+            "reason": "systemd service checks are Linux-only",
+            "running_count": 0,
+            "running": [],
+            "watched": [{"unit": unit, "state": "not_applicable", "scope": None}
+                        for unit in WATCHED_UNITS],
+            "failed": [],
+        }
+    result = collect_linux_services()
+    result.setdefault("availability", (AVAILABILITY_AVAILABLE if result.get("available")
+                                       else AVAILABILITY_UNAVAILABLE))
+    return result
+
+
 LAN_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
     "fc00::/7", "fe80::/10",
@@ -667,7 +1081,7 @@ def _listener_scope(host: str, tailscale_addresses: set[str] | None = None) -> s
     return "external"
 
 
-def collect_listeners() -> tuple[list[dict], str | None]:
+def collect_linux_listeners() -> tuple[list[dict], str | None]:
     """Listening TCP sockets with owning process - shows agent servers."""
     out, error = run_result(["ss", "-ltnpH"])
     tailscale_addresses = _tailscale_addresses()
@@ -692,6 +1106,40 @@ def collect_listeners() -> tuple[list[dict], str | None]:
     return res, error
 
 
+def collect_macos_listeners() -> tuple[list[dict], str | None]:
+    out, error = run_result(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], timeout=5)
+    if error:
+        return [], error
+    res = []
+    for line in out.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) < 9:
+            continue
+        command = cols[0]
+        try:
+            pid = int(cols[1])
+        except ValueError:
+            pid = None
+        endpoint = cols[-2] if cols[-1] == "(LISTEN)" else cols[-1]
+        host, port = _split_endpoint(endpoint)
+        res.append({
+            "address": endpoint, "host": host, "port": port,
+            "scope": _listener_scope(host, set()), "process": (
+                f"{command}({pid})" if pid is not None else command),
+            "process_name": command, "pid": pid,
+            "agent_kind": _agent_kind_from_names([command]),
+        })
+    return res, None
+
+
+def collect_listeners() -> tuple[list[dict], str | None]:
+    if _platform_id() == "macos":
+        return collect_macos_listeners()
+    if _platform_id() != "linux":
+        return [], "listener checks unsupported on this platform"
+    return collect_linux_listeners()
+
+
 # --------------------------------------------------------------------------- #
 # opencode  (SQLite backend; schema verified against opencode 1.18.18)
 # --------------------------------------------------------------------------- #
@@ -704,7 +1152,7 @@ REQUIRED_COLUMNS = {
                 "tokens_cache_read", "tokens_cache_write", "time_created",
                 "time_updated", "time_archived", "version"},
     "message": {"id", "data"},
-    "part": {"message_id", "session_id", "time_created", "data"},
+    "part": {"id", "message_id", "session_id", "time_created", "data"},
 }
 ZERO_TOKENS = {"input": 0, "output": 0, "reasoning": 0,
                "cache_read": 0, "cache_write": 0}
@@ -829,7 +1277,7 @@ def _is_agent_proc(pid: int, cmd: str) -> str | None:
     return _agent_kind_from_names(names)
 
 
-def _agent_processes(scrub: bool = False) -> list[dict]:
+def _linux_agent_processes(scrub: bool = False) -> list[dict]:
     """Live AI agent and model runtime processes, read straight from /proc."""
     procs = []
     for entry in os.listdir("/proc"):
@@ -860,6 +1308,56 @@ def _agent_processes(scrub: bool = False) -> list[dict]:
         })
     procs.sort(key=lambda p: p["age_seconds"] or 0)
     return procs
+
+
+def _macos_agent_processes(scrub: bool = False) -> list[dict]:
+    out, error = run_result(["ps", "-axo", "pid=,comm=,rss=,etimes=,args="])
+    if error:
+        return []
+    procs = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 4)
+        if len(parts) < 5:
+            continue
+        try:
+            pid = int(parts[0])
+            rss = int(parts[2]) * 1024
+            age = int(parts[3])
+        except ValueError:
+            continue
+        comm = parts[1]
+        args = parts[4]
+        names = [comm, os.path.basename(args.split(" ", 1)[0])]
+        argv = args.split()
+        if names[-1] in ("node", "bun", "deno") and len(argv) > 1:
+            names.append(os.path.basename(argv[1]))
+            script = argv[1].replace("\\", "/")
+            if script.endswith("/cli.js") and "/@anthropic-ai/claude-code/" in script:
+                kind = "claude"
+            else:
+                kind = _agent_kind_from_names(names)
+        else:
+            kind = _agent_kind_from_names(names)
+        if not kind:
+            continue
+        procs.append({
+            "pid": pid,
+            "kind": kind,
+            "tty": None,
+            "rss_bytes": rss,
+            "age_seconds": age,
+            "cmdline": None if scrub else args[:160],
+        })
+    procs.sort(key=lambda p: p["age_seconds"] or 0)
+    return procs
+
+
+def _agent_processes(scrub: bool = False) -> list[dict]:
+    if _platform_id() == "macos":
+        return _macos_agent_processes(scrub)
+    if _platform_id() != "linux" or not os.path.isdir("/proc"):
+        return []
+    return _linux_agent_processes(scrub)
 
 
 def collect_agents(processes: list[dict]) -> dict:
@@ -904,12 +1402,14 @@ def _claude_usage(record: dict) -> dict | None:
 def collect_claude(days: int = 7, scrub: bool = False) -> dict:
     root = os.path.expanduser("~/.claude/projects")
     out = {
-        "available": False, "reason": None, "source": "local_files",
+        "available": False, "availability": AVAILABILITY_UNAVAILABLE,
+        "reason": None, "source": "local_files",
         "version": None, "window_days": days, "projects": [],
         "totals": dict(ZERO_TOKENS, turns=0),
         "tokens_by_day": {},
         "parse": {"files_seen": 0, "files_failed": 0, "records_ignored": 0,
-                  "records_recognized": 0},
+                  "records_recognized": 0, "records_duplicate": 0},
+        "partial": False,
         "cost_usd": None,
     }
     if not os.path.isdir(root):
@@ -920,6 +1420,7 @@ def collect_claude(days: int = 7, scrub: bool = False) -> dict:
     out["version"] = version[0] if version else None
     cutoff = time.time() - days * 86400
     projects = {}
+    seen_records = set()
     for project_dir, _, filenames in os.walk(root):
         for filename in filenames:
             if not filename.endswith(".jsonl"):
@@ -952,6 +1453,17 @@ def collect_claude(days: int = 7, scrub: bool = False) -> dict:
                         if usage is None:
                             continue
                         out["parse"]["records_recognized"] += 1
+                        record_id = (record.get("uuid") or record.get("id") or
+                                     record.get("requestId") or record.get("request_id"))
+                        signature = (("id", record_id) if record_id else
+                                     ("file", path, json.dumps({
+                                         "timestamp": record.get("timestamp"),
+                                         "usage": usage,
+                                     }, sort_keys=True)))
+                        if signature in seen_records:
+                            out["parse"]["records_duplicate"] += 1
+                            continue
+                        seen_records.add(signature)
                         if timestamp is None or timestamp < cutoff:
                             continue
                         valid_session = True
@@ -981,10 +1493,23 @@ def collect_claude(days: int = 7, scrub: bool = False) -> dict:
     out["projects"].sort(key=lambda item: item["project_hash"])
     recognized = out["parse"]["records_recognized"]
     out["available"] = bool(recognized or not out["parse"]["files_seen"])
+    out["availability"] = (AVAILABILITY_AVAILABLE if out["available"]
+                           else AVAILABILITY_UNAVAILABLE)
     if not out["available"]:
         out["reason"] = "Claude Code JSONL schema unsupported"
     elif out["parse"]["files_failed"]:
+        out["partial"] = True
+        out["availability"] = AVAILABILITY_PARTIAL
         out["reason"] = "some Claude Code files could not be read"
+    elif out["parse"]["records_ignored"] or out["parse"]["records_duplicate"]:
+        out["partial"] = True
+        out["availability"] = AVAILABILITY_PARTIAL
+        parts = []
+        if out["parse"]["records_ignored"]:
+            parts.append("some Claude Code records could not be parsed")
+        if out["parse"]["records_duplicate"]:
+            parts.append("duplicate Claude Code records were ignored")
+        out["reason"] = "; ".join(parts)
     return out
 
 
@@ -1011,7 +1536,8 @@ def _parse_ollama_table(output: str) -> list[list[str]]:
 
 
 def collect_ollama(scrub: bool = False) -> dict:
-    out = {"available": False, "reason": None, "source": "ollama_cli",
+    out = {"available": False, "availability": AVAILABILITY_UNAVAILABLE,
+           "reason": None, "source": "ollama_cli",
            "version": None, "models": [], "running": [], "partial": False}
     version = run(["ollama", "--version"]).strip()
     out["version"] = version or None
@@ -1042,10 +1568,12 @@ def collect_ollama(scrub: bool = False) -> dict:
         return out
     if valid_model_rows != len(data_lines):
         out["partial"] = True
+        out["availability"] = AVAILABILITY_PARTIAL
         out["reason"] = "some Ollama list rows could not be parsed"
     running, running_error = run_result(["ollama", "ps"])
     if running_error:
         out["partial"] = True
+        out["availability"] = AVAILABILITY_PARTIAL
         out["reason"] = f"ollama ps unavailable: {running_error}"
     else:
         running_lines = [line for line in running.splitlines()[1:] if line.strip()]
@@ -1063,13 +1591,17 @@ def collect_ollama(scrub: bool = False) -> dict:
             })
         if len(valid_running_rows) != len(running_lines):
             out["partial"] = True
+            out["availability"] = AVAILABILITY_PARTIAL
             out["reason"] = out["reason"] or "some Ollama process rows could not be parsed"
     out["available"] = True
+    if not out["partial"]:
+        out["availability"] = AVAILABILITY_AVAILABLE
     return out
 
 
 def collect_changes(scrub: bool = False) -> dict:
-    out = {"available": False, "reason": None, "source": "git", "root": None,
+    out = {"available": False, "availability": AVAILABILITY_UNAVAILABLE,
+           "reason": None, "source": "git", "root": None,
            "head": None, "dirty": False,
            "counts": {"modified": 0, "added": 0, "deleted": 0,
                       "renamed": 0, "untracked": 0},
@@ -1120,6 +1652,7 @@ def collect_changes(scrub: bool = False) -> dict:
     fingerprint = json.dumps({"head": head, "status": status, "numstat": numstat}, sort_keys=True)
     out["fingerprint"] = f"sha256:{hashlib.sha256(fingerprint.encode()).hexdigest()[:16]}"
     out["available"] = True
+    out["availability"] = AVAILABILITY_AVAILABLE
     return out
 
 
@@ -1134,6 +1667,7 @@ def collect_opencode(days: int = 7, scrub: bool = False,
     """
     out: dict = {
         "available": False,
+        "availability": AVAILABILITY_UNAVAILABLE,
         "reason": None,
         "db_path": None,
         "version": None,   # filled from session.version below - no subprocess
@@ -1150,6 +1684,15 @@ def collect_opencode(days: int = 7, scrub: bool = False,
         "cost_usd": 0.0,
         "todos": [],
         "stored_matches_summed": None,
+        "partial": False,
+        "parse": {
+            "part_rows": 0,
+            "step_finish_rows": 0,
+            "records_counted": 0,
+            "records_ignored": 0,
+            "records_invalid": 0,
+            "records_duplicate": 0,
+        },
     }
 
     path = _opencode_db_path()
@@ -1229,17 +1772,35 @@ def collect_opencode(days: int = 7, scrub: bool = False,
         by_day: dict[str, int] = defaultdict(int)
 
         rows = con.execute(
-            "SELECT p.session_id AS sid, p.time_created AS ts, "
-            "       p.data AS pdata, m.data AS mdata "
+            "SELECT p.id AS pid, p.message_id AS mid, p.session_id AS sid, "
+            "       p.time_created AS ts, p.data AS pdata, m.data AS mdata "
             "FROM part p LEFT JOIN message m ON m.id = p.message_id "
             "WHERE p.time_created >= ?", (cutoff_ms,))
 
+        seen_step_finish = set()
         for r in rows:
-            pdata = _jload(r["pdata"])
+            out["parse"]["part_rows"] += 1
+            try:
+                pdata_raw = r["pdata"]
+                pdata = json.loads(pdata_raw) if isinstance(pdata_raw, str) else pdata_raw
+            except (json.JSONDecodeError, TypeError, ValueError):
+                out["parse"]["records_invalid"] += 1
+                continue
+            if not isinstance(pdata, dict):
+                out["parse"]["records_invalid"] += 1
+                continue
             if pdata.get("type") != "step-finish":
                 continue
+            out["parse"]["step_finish_rows"] += 1
+            duplicate_signature = (r["mid"], r["ts"],
+                                   json.dumps(pdata, sort_keys=True, default=str))
+            if duplicate_signature in seen_step_finish:
+                out["parse"]["records_duplicate"] += 1
+                continue
+            seen_step_finish.add(duplicate_signature)
             tok = _part_tokens(pdata)
             if not tok or not any(tok.values()):
+                out["parse"]["records_ignored"] += 1
                 continue
 
             sess = sessions.get(r["sid"])
@@ -1267,6 +1828,7 @@ def collect_opencode(days: int = 7, scrub: bool = False,
                 sess["turns"] += 1
                 sess["cost_usd"] += cost
                 sess["models"].add(label)
+            out["parse"]["records_counted"] += 1
 
         out["tokens_by_model"] = {k: dict(v) for k, v in by_model.items()}
         out["tokens_by_day"] = dict(sorted(by_day.items()))
@@ -1301,6 +1863,22 @@ def collect_opencode(days: int = 7, scrub: bool = False,
                         "content": None if scrub else r["content"][:80],
                     })
 
+        if (out["parse"]["records_invalid"] or out["parse"]["records_ignored"] or
+                out["parse"]["records_duplicate"]):
+            out["partial"] = True
+            out["availability"] = AVAILABILITY_PARTIAL
+            parts = []
+            if out["parse"]["records_invalid"]:
+                parts.append("some opencode part rows were invalid")
+            if out["parse"]["records_ignored"]:
+                parts.append("some opencode step-finish rows lacked usable tokens")
+            if out["parse"]["records_duplicate"]:
+                parts.append("duplicate opencode step-finish rows were ignored")
+            out["reason"] = "; ".join(parts)
+        else:
+            out["availability"] = (AVAILABILITY_AVAILABLE
+                                   if out["data_confidence"] == "verified"
+                                   else AVAILABILITY_UNVERIFIED)
         out["available"] = True
     except sqlite3.Error as exc:
         out["reason"] = f"query failed: {exc}"
@@ -1322,11 +1900,16 @@ def collect_warnings(snap: dict, config: dict | None = None) -> list[dict]:
         warnings.append({"code": code, "message": message})
 
     if c := snap.get("cpu"):
-        if c["usage_pct"] >= 90 or c["load_per_core"] >= 1.0:
+        if not c.get("available", True) and not is_unsupported(c):
+            add("cpu_unavailable", f"CPU data unavailable: {c.get('reason') or 'unknown error'}")
+        elif c["usage_pct"] >= 90 or c["load_per_core"] >= 1.0:
             add("cpu_high", f"CPU pressure is high ({c['usage_pct']:.1f}%, "
                 f"{c['load_per_core']:.2f}x load per core)")
     if m := snap.get("memory"):
-        if m["total_bytes"] and m["available_bytes"] / m["total_bytes"] <= 0.10:
+        if not m.get("available", True) and not is_unsupported(m):
+            add("memory_unavailable",
+                f"memory data unavailable: {m.get('reason') or 'unknown error'}")
+        elif m["total_bytes"] and m["available_bytes"] / m["total_bytes"] <= 0.10:
             add("memory_low", f"only {human_bytes(m['available_bytes'])} RAM available")
     config = config or {}
     disk_warning_pct = _config_number(config, "disk_warning_pct", 85, 0)
@@ -1337,13 +1920,13 @@ def collect_warnings(snap: dict, config: dict | None = None) -> list[dict]:
         if (disk.get("inode_used_pct") is not None and
                 disk["inode_used_pct"] >= inode_warning_pct):
             add("inode_high", f"{disk['path']} inodes are {disk['inode_used_pct']:.1f}% used")
-        if disk.get("read_only"):
+        if disk.get("read_only") and disk.get("operational", True):
             add("disk_read_only", f"{disk['path']} is mounted read-only")
         if disk.get("deep", {}).get("partial"):
             add("disk_deep_partial", "deep storage scan completed with errors")
 
     if pressure := snap.get("pressure"):
-        if not pressure.get("available", True):
+        if not pressure.get("available", True) and not is_unsupported(pressure):
             add("pressure_unavailable",
                 f"pressure data unavailable: {pressure.get('reason') or 'unknown error'}")
         cpu = (pressure.get("cpu") or {}).get("some", {}).get("avg10", 0)
@@ -1357,14 +1940,14 @@ def collect_warnings(snap: dict, config: dict | None = None) -> list[dict]:
             add("io_pressure_high", f"I/O full pressure is {io:.1f}%")
 
     if g := snap.get("gpu"):
-        if not g.get("available", True):
+        if not g.get("available", True) and not is_unsupported(g):
             add("gpu_unavailable", f"GPU data unavailable: {g.get('reason') or 'unknown error'}")
         for gpu in g.get("gpus", []):
             if gpu.get("temp_c") is not None and gpu["temp_c"] >= 85:
                 add("gpu_hot", f"GPU {gpu['index']} is {gpu['temp_c']:.0f} C")
 
     if services := snap.get("services"):
-        if not services.get("available", True):
+        if not services.get("available", True) and not is_unsupported(services):
             add("services_unavailable",
                 f"service data unavailable: {services.get('reason') or 'unknown error'}")
         failed = {unit.removesuffix(".service") for unit in services.get("failed", [])}
@@ -1373,7 +1956,9 @@ def collect_warnings(snap: dict, config: dict | None = None) -> list[dict]:
         for watched in services.get("watched", []):
             if watched["state"] == "failed" and watched["unit"] not in failed:
                 add("watched_service_failed", f"{watched['unit']} service failed")
-        if not services.get("listeners_available", True):
+        if is_unsupported(services):
+            pass
+        elif not services.get("listeners_available", True):
             add("listeners_unavailable",
                 f"listener data unavailable: {services.get('listeners_reason') or 'unknown error'}")
         elif not services.get("listener_owners_available", True):
@@ -1391,6 +1976,9 @@ def collect_warnings(snap: dict, config: dict | None = None) -> list[dict]:
     if oc := snap.get("opencode"):
         if not oc.get("available"):
             add("opencode_unavailable", f"opencode data unavailable: {oc.get('reason')}")
+        elif oc.get("partial"):
+            add("opencode_partial",
+                f"opencode data is partial: {oc.get('reason') or 'incomplete records'}")
         elif oc.get("data_confidence") != "verified":
             if oc.get("version"):
                 message = (f"opencode {oc['version']} differs from tested "
@@ -1401,10 +1989,21 @@ def collect_warnings(snap: dict, config: dict | None = None) -> list[dict]:
     for name in ("claude", "ollama"):
         if provider := snap.get(name):
             if not provider.get("available"):
-                add(f"{name}_unavailable",
-                    f"{name} data unavailable: {provider.get('reason') or 'unknown error'}")
+                expected = name in set(config.get("expected_providers", []))
+                if expected or not is_unsupported(provider):
+                    add(f"{name}_unavailable",
+                        f"{name} data unavailable: {provider.get('reason') or 'unknown error'}")
             elif provider.get("reason"):
                 add(f"{name}_partial", f"{name} data is partial: {provider['reason']}")
+    for provider in config.get("expected_providers", []):
+        if provider not in snap:
+            add("expected_provider_missing", f"{provider} was expected but not checked")
+    expected_services = set(config.get("expected_services", []))
+    if expected_services and (services := snap.get("services")):
+        watched = {item["unit"]: item["state"] for item in services.get("watched", [])}
+        for service in sorted(expected_services):
+            if watched.get(service) != "active":
+                add("expected_service_missing", f"{service} was expected but is not active")
     return warnings
 
 
@@ -1449,6 +2048,20 @@ def collect_capacity(snap: dict, config: dict | None = None) -> dict:
     checks = []
     min_ram = int(_config_number(config, "capacity_min_ram_bytes", 2 * 1024 ** 3, 1))
     min_disk = int(_config_number(config, "capacity_min_disk_bytes", 10 * 1024 ** 3, 1))
+    cpu = snap.get("cpu")
+    if cpu and cpu.get("available", True):
+        if cpu.get("usage_pct", 0) >= 95 or cpu.get("load_per_core", 0) >= 2.0:
+            checks.append({"name": "cpu", "status": "warning",
+                           "message": f"{cpu.get('usage_pct', 0):.1f}% used, "
+                                      f"{cpu.get('load_per_core', 0):.2f}x load/core"})
+        else:
+            checks.append({"name": "cpu", "status": "ready",
+                           "message": f"{cpu.get('usage_pct', 0):.1f}% used"})
+    elif cpu and is_unsupported(cpu):
+        checks.append({"name": "cpu", "status": "not_applicable",
+                       "message": "not supported on this platform"})
+    else:
+        checks.append({"name": "cpu", "status": "unknown", "message": "data unavailable"})
     memory = snap.get("memory")
     if memory and memory.get("total_bytes", 0) > 0:
         checks.append({"name": "ram", "status": "ready" if memory["available_bytes"] >= min_ram
@@ -1458,18 +2071,28 @@ def collect_capacity(snap: dict, config: dict | None = None) -> dict:
     disk = snap.get("disk", [])
     if disk and all(item.get("total_bytes", 0) > 0 for item in disk):
         free = min(item["free_bytes"] for item in disk)
-        checks.append({"name": "disk", "status": "ready" if free >= min_disk
-                       else "blocked", "message": human_bytes(free) + " free"})
+        read_only = [item["path"] for item in disk
+                     if item.get("read_only") and item.get("operational", True)]
+        if read_only:
+            checks.append({"name": "disk", "status": "blocked",
+                           "message": f"{read_only[0]} is read-only"})
+        else:
+            checks.append({"name": "disk", "status": "ready" if free >= min_disk
+                           else "blocked", "message": human_bytes(free) + " free"})
     else:
         checks.append({"name": "disk", "status": "unknown", "message": "data unavailable"})
     pressure = snap.get("pressure")
-    io_value = ((pressure or {}).get("io")
-                if pressure and pressure.get("available", True) else None)
-    io10 = (io_value or {}).get("full", {}).get("avg10")
-    checks.append({"name": "io", "status": ("unknown" if io10 is None else
-                                               "warning" if io10 >= 10 else "ready"),
-                   "message": ("data unavailable" if io10 is None else
-                               f"{io10:.1f}% I/O full pressure")})
+    if pressure and is_unsupported(pressure):
+        checks.append({"name": "io", "status": "not_applicable",
+                       "message": "PSI is Linux-only"})
+    else:
+        io_value = ((pressure or {}).get("io")
+                    if pressure and pressure.get("available", True) else None)
+        io10 = (io_value or {}).get("full", {}).get("avg10")
+        checks.append({"name": "io", "status": ("unknown" if io10 is None else
+                                                   "warning" if io10 >= 10 else "ready"),
+                       "message": ("data unavailable" if io10 is None else
+                                   f"{io10:.1f}% I/O full pressure")})
     status = "blocked" if any(c["status"] == "blocked" for c in checks) else (
         "warning" if any(c["status"] in ("warning", "unknown") for c in checks) else "ready")
     return {"status": status, "checks": checks}
@@ -1523,6 +2146,10 @@ def redact_snapshot(snap: dict) -> None:
             proc["pid"] = None
             proc["name"] = "(redacted)"
     for disk in snap.get("disk", []):
+        if disk.get("path"):
+            disk["path"] = "(redacted)"
+        if disk.get("mount_point"):
+            disk["mount_point"] = "(redacted)"
         if disk.get("mount_source"):
             disk["mount_source"] = "(redacted)"
         if deep := disk.get("deep"):
@@ -1580,6 +2207,13 @@ def redact_snapshot(snap: dict) -> None:
             changes["head"]["subject"] = None
 
 
+def redact_warning_text(snap: dict) -> None:
+    home = re.escape(os.path.expanduser("~"))
+    path_re = re.compile(rf"({home}|/Users/[^,\s:;]+|/home/[^,\s:;]+)[^,\s:;]*")
+    for warning in snap.get("warnings", []):
+        warning["message"] = path_re.sub("(redacted-path)", clean_text(warning["message"]))
+
+
 def snapshot(days: int = 7, sections: set[str] | None = None,
              scrub: bool = False, deep: bool = False) -> dict:
     want = sections or {"cpu", "mem", "gpu", "disk", "pressure", "services",
@@ -1596,6 +2230,7 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
         "schema_version": JSON_SCHEMA_VERSION,
         "hostname": os.uname().nodename,
         "kernel": os.uname().release,
+        "platform": platform_info(),
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     if "cpu" in want or "procs" in want:
@@ -1650,6 +2285,8 @@ def snapshot(days: int = 7, sections: set[str] | None = None,
             })
     if "explain" in want:
         snap["explain"] = collect_explain(snap["warnings"])
+    if scrub:
+        redact_warning_text(snap)
     snap["status"] = "WARNING" if snap["warnings"] else "OK"
     return snap
 
@@ -1942,6 +2579,8 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
         for item in explain:
             L.append(f"  {item['code']}: {item['meaning']} {item['suggestion']}")
 
+    if plain:
+        L = [clean_text(line) for line in L]
     return "\n".join(clip(line, width) for line in L)
 
 

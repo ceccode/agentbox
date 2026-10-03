@@ -306,7 +306,7 @@ class TestReleaseOneCollectors(unittest.TestCase):
                   'users:(("ollama",pid=42,fd=3))\n')
         with mock.patch.object(agentbox, "run_result", return_value=(output, None)), \
                 mock.patch.object(agentbox, "_tailscale_addresses", return_value=set()):
-            listeners, error = agentbox.collect_listeners()
+            listeners, error = agentbox.collect_linux_listeners()
         self.assertIsNone(error)
         self.assertEqual(listeners[0]["agent_kind"], "ollama")
         self.assertEqual(listeners[0]["scope"], "wildcard")
@@ -372,7 +372,7 @@ class TestReleaseOneCollectors(unittest.TestCase):
 class TestReleaseTwoCollectors(unittest.TestCase):
     def test_claude_usage_is_normalized_without_content(self):
         record = {
-            "timestamp": "2026-08-17T12:00:00Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "message": {"usage": {
                 "input_tokens": 10, "output_tokens": 4,
                 "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2,
@@ -476,6 +476,7 @@ class TestReleaseThreeCollectors(unittest.TestCase):
 
     def test_capacity_and_explain_are_deterministic(self):
         snap = {
+            "cpu": {"available": True, "usage_pct": 1, "load_per_core": 0},
             "memory": {"available_bytes": 1, "total_bytes": 2},
             "disk": [{"free_bytes": 1}],
             "pressure": {"io": {"full": {"avg10": 20}}},
@@ -500,12 +501,14 @@ class TestReleaseThreeCollectors(unittest.TestCase):
 
     def test_capacity_zero_collectors_are_unknown(self):
         capacity = agentbox.collect_capacity({
+            "cpu": {"available": False},
             "memory": {"total_bytes": 0, "available_bytes": 0},
             "disk": [{"total_bytes": 0, "free_bytes": 0}],
             "pressure": {"io": {"full": {"avg10": 0}}},
         })
         self.assertEqual(capacity["status"], "warning")
-        self.assertEqual([c["status"] for c in capacity["checks"]], ["unknown", "unknown", "ready"])
+        self.assertEqual([c["status"] for c in capacity["checks"]],
+                         ["unknown", "unknown", "unknown", "ready"])
 
     def test_unavailable_usage_is_explicit(self):
         usage = agentbox.collect_usage({
@@ -573,6 +576,114 @@ class TestReleaseThreeCollectors(unittest.TestCase):
         self.assertIn("capacity_blocked", {w["code"] for w in snap["warnings"]})
         self.assertEqual(snap["schema_version"], 1)
 
+    def test_unreadable_meminfo_is_not_healthy_zero(self):
+        with mock.patch.object(agentbox, "_platform_id", return_value="linux"), \
+                mock.patch.object(agentbox.os.path, "exists", return_value=True), \
+                mock.patch.object(agentbox, "read", return_value=""):
+            mem = agentbox.collect_mem()
+        self.assertFalse(mem["available"])
+        warnings = agentbox.collect_warnings({"memory": mem})
+        self.assertEqual(warnings[0]["code"], "memory_unavailable")
+
+    def test_opencode_corrupt_part_is_partial(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = build_fixture(os.path.join(root, "fixture.db"))
+            con = sqlite3.connect(path)
+            now = int(time.time() * 1000)
+            con.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                        ("broken", "msg_0", "ses_A", now, now, "{not json"))
+            con.commit()
+            con.close()
+            with mock.patch.dict(os.environ, {"AGENTBOX_OPENCODE_DB": path}):
+                out = agentbox.collect_opencode(days=30, live_processes=[])
+        self.assertTrue(out["available"])
+        self.assertTrue(out["partial"])
+        self.assertEqual(out["parse"]["records_invalid"], 1)
+        self.assertEqual(agentbox.collect_warnings({"opencode": out})[0]["code"],
+                         "opencode_partial")
+
+    def test_opencode_duplicate_step_finish_is_not_double_counted(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = build_fixture(os.path.join(root, "fixture.db"))
+            con = sqlite3.connect(path)
+            row = con.execute("SELECT message_id, session_id, time_created, time_updated, data "
+                              "FROM part WHERE id='prt_0'").fetchone()
+            con.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                        ("dup", row[0], row[1], row[2], row[3], row[4]))
+            con.commit()
+            con.close()
+            with mock.patch.dict(os.environ, {"AGENTBOX_OPENCODE_DB": path}):
+                out = agentbox.collect_opencode(days=30, live_processes=[])
+        self.assertEqual(out["tokens_total"]["input"], SUM_IN)
+        self.assertEqual(out["parse"]["records_duplicate"], 1)
+        self.assertTrue(out["partial"])
+
+    def test_claude_corrupt_record_is_partial_when_usage_is_available(self):
+        valid = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": {"usage": {"input_tokens": 10, "output_tokens": 1}},
+        }
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "project")
+            os.makedirs(project)
+            with open(os.path.join(project, "session.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write("{not json\n")
+                fh.write(json.dumps(valid) + "\n")
+            with mock.patch.object(agentbox.os.path, "expanduser", return_value=root):
+                out = agentbox.collect_claude(days=1)
+        self.assertTrue(out["available"])
+        self.assertTrue(out["partial"])
+        self.assertIn("records", out["reason"])
+
+    def test_claude_duplicate_record_is_not_double_counted(self):
+        record = {
+            "uuid": "same-message",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": {"usage": {"input_tokens": 10, "output_tokens": 1}},
+        }
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "project")
+            os.makedirs(project)
+            with open(os.path.join(project, "session.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+                fh.write(json.dumps(record) + "\n")
+            with mock.patch.object(agentbox.os.path, "expanduser", return_value=root):
+                out = agentbox.collect_claude(days=1)
+        self.assertEqual(out["totals"]["input"], 10)
+        self.assertEqual(out["parse"]["records_duplicate"], 1)
+        self.assertTrue(out["partial"])
+
+    def test_capacity_warns_on_cpu_pressure_and_blocks_read_only_disk(self):
+        capacity = agentbox.collect_capacity({
+            "cpu": {"available": True, "usage_pct": 99, "load_per_core": 0.5},
+            "memory": {"total_bytes": 10, "available_bytes": 10},
+            "disk": [{"total_bytes": 10, "free_bytes": 10, "path": "/", "read_only": True}],
+            "pressure": {"availability": "unsupported", "available": False},
+        }, {"capacity_min_ram_bytes": 1, "capacity_min_disk_bytes": 1})
+        statuses = {check["name"]: check["status"] for check in capacity["checks"]}
+        self.assertEqual(statuses["cpu"], "warning")
+        self.assertEqual(statuses["disk"], "blocked")
+        self.assertEqual(statuses["io"], "not_applicable")
+        self.assertEqual(capacity["status"], "blocked")
+
+    def test_plain_output_strips_control_sequences_from_data(self):
+        snap = {"hostname": "box", "timestamp": "now", "status": "WARNING",
+                "warnings": [{"code": "x", "message": "\x1b[31mred\x00alert"}]}
+        text = agentbox.render(snap, plain=True)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x00", text)
+        self.assertIn("redalert", text)
+
+    def test_expected_provider_config_is_validated(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"expected_providers": ["opencdoe"]}, fh)
+            with mock.patch.object(agentbox.os.path, "expanduser", return_value=path):
+                config, error = agentbox.load_config()
+        self.assertNotIn("expected_providers", config)
+        self.assertIn("unknown expected provider", error)
+
 
 class TestStatusAndRendering(unittest.TestCase):
     def test_warning_summary(self):
@@ -590,6 +701,8 @@ class TestStatusAndRendering(unittest.TestCase):
             "listening": [{"address": "10.0.0.1:8080", "port": "8080",
                            "process": "server(123)"}],
             "gpu": {"processes": [{"pid": 456, "name": "secret-worker"}]},
+            "disk": [{"path": "/Users/person", "mount_point": "/Users",
+                      "mount_source": "/dev/disk"}],
             "opencode": {
                 "db_path": "/home/user/opencode.db",
                 "live_processes": [{"pid": 123, "tty": "pts/1", "cmdline": "/secret"}],
@@ -606,7 +719,7 @@ class TestStatusAndRendering(unittest.TestCase):
         for secret in ("private-host", "10.0.0.1", "ses_secret", "ses_parent",
                        "/home/user", "pts/1", "/secret", "secret title", "secret todo",
                        "secret-worker", "server(123)", "python", "private-provider",
-                       "private-model"):
+                       "private-model", "/Users/person"):
             self.assertNotIn(secret, blob)
         self.assertEqual(snap["listening"][0]["address"], "*:8080")
 
@@ -677,7 +790,8 @@ class TestStatusAndRendering(unittest.TestCase):
             return "inactive\n"
 
         with mock.patch.object(agentbox, "run_result", side_effect=fake_result), \
-                mock.patch.object(agentbox, "run", side_effect=fake_run):
+                mock.patch.object(agentbox, "run", side_effect=fake_run), \
+                mock.patch.object(agentbox, "_platform_id", return_value="linux"):
             services = agentbox.collect_services()
         self.assertEqual([w["unit"] for w in services["watched"]], agentbox.WATCHED_UNITS)
         ollama = next(w for w in services["watched"] if w["unit"] == "ollama")
@@ -687,9 +801,17 @@ class TestStatusAndRendering(unittest.TestCase):
 class TestCollector(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        build_fixture()
+        cls.tmp = tempfile.TemporaryDirectory()
+        global FIXTURE
+        FIXTURE = os.path.join(cls.tmp.name, "fixture.db")
+        build_fixture(FIXTURE)
         os.environ["AGENTBOX_OPENCODE_DB"] = FIXTURE
         cls.oc = agentbox.collect_opencode(days=30)
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("AGENTBOX_OPENCODE_DB", None)
+        cls.tmp.cleanup()
 
     def test_version_read_from_db_not_subprocess(self):
         self.assertEqual(self.oc["version"], "1.18.18")
@@ -744,21 +866,27 @@ class TestCollector(unittest.TestCase):
 class TestDegradation(unittest.TestCase):
     """The snapshot must never crash just because opencode is absent/changed."""
 
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fixture = build_fixture(os.path.join(self.tmp.name, "fixture.db"))
+        os.environ["AGENTBOX_OPENCODE_DB"] = self.fixture
+
+    def tearDown(self):
+        os.environ.pop("AGENTBOX_OPENCODE_DB", None)
+        self.tmp.cleanup()
+
     def test_missing_db(self):
         """An explicit override must NOT silently fall back to a real DB."""
         os.environ["AGENTBOX_OPENCODE_DB"] = "/nonexistent/nope.db"
         oc = agentbox.collect_opencode()
-        os.environ["AGENTBOX_OPENCODE_DB"] = FIXTURE
         self.assertFalse(oc["available"])
         self.assertIsNotNone(oc["reason"])
 
     def test_schema_mismatch(self):
-        path = FIXTURE + ".empty"
+        path = os.path.join(self.tmp.name, "empty.db")
         sqlite3.connect(path).close()
         os.environ["AGENTBOX_OPENCODE_DB"] = path
         oc = agentbox.collect_opencode()
-        os.environ["AGENTBOX_OPENCODE_DB"] = FIXTURE
-        os.remove(path)
         self.assertFalse(oc["available"])
         self.assertIn("schema mismatch", oc["reason"])
 

@@ -59,10 +59,12 @@ reads `AGENTS.md`, falling back to `CLAUDE.md`; Claude Code reads `CLAUDE.md`):
 ```markdown
 ## Machine monitoring
 Run `agentbox --json` for a full system snapshot, or `agentbox --json opencode`
-for token usage. Always use --json and parse it — never read /proc or run
-nvidia-smi by hand. Summarize in plain language and flag anything concerning:
-high sustained CPU, low free RAM, disk over 85%, GPU thermal throttling,
-runaway token consumption.
+for token usage. Always use --json and parse it — never read `/proc`, run
+`top`, `nvidia-smi`, or provider databases by hand. Summarize in plain language
+and flag anything concerning: high sustained CPU, low available RAM, disk over
+85%, read-only operational filesystems, GPU temperature warnings where
+supported, partial provider accounting, or runaway token consumption. Treat
+`availability: "unsupported"` as a platform limit rather than a failure.
 ```
 
 Cheaper to set up, but it costs context on every single turn whether or not the
