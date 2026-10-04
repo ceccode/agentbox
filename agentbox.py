@@ -310,8 +310,13 @@ def _sysctl_int(name: str) -> int | None:
 
 
 def _macos_cpu_usage(interval: float = SAMPLE_INTERVAL) -> tuple[float | None, str | None, float]:
+    # macOS `top -s` only accepts whole seconds. A fractional delay is a usage
+    # error with no output, which would push every snapshot onto the ps
+    # fallback below and report an `unverified` lifetime average instead of
+    # the current load. Round up, never below one second.
+    delay = max(1, math.ceil(interval))
     start = time.monotonic()
-    out, error = run_result(["top", "-l", "2", "-s", str(interval), "-n", "0"], timeout=5)
+    out, error = run_result(["top", "-l", "2", "-s", str(delay), "-n", "0"], timeout=5)
     elapsed = max(0.001, time.monotonic() - start)
     if error and not out:
         ps_out, ps_error = run_result(["ps", "-A", "-o", "%cpu="])

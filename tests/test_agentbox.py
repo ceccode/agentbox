@@ -895,5 +895,42 @@ class TestDegradation(unittest.TestCase):
         self.assertIsInstance(agentbox.render(snap), str)
 
 
+class TestMacosCpuSampling(unittest.TestCase):
+    """macOS `top -s` rejects fractional delays. A fractional SAMPLE_INTERVAL
+    used to make every snapshot fall back to the ps lifetime average and
+    report it as unverified."""
+
+    TOP_OUTPUT = (
+        "CPU usage: 13.16% user, 16.66% sys, 70.17% idle \n"
+        "CPU usage: 13.5% user, 9.86% sys, 77.8% idle \n"
+    )
+
+    def test_top_gets_a_whole_second_delay_and_last_sample_wins(self):
+        calls = []
+
+        def fake_run(cmd, timeout=5):
+            calls.append(cmd)
+            return self.TOP_OUTPUT, None
+
+        with mock.patch.object(agentbox, "run_result", side_effect=fake_run):
+            usage, reason, _ = agentbox._macos_cpu_usage(interval=0.4)
+
+        top_cmd = calls[0]
+        self.assertEqual(top_cmd[0], "top")
+        delay = top_cmd[top_cmd.index("-s") + 1]
+        self.assertEqual(delay, "1", "macOS top -s only accepts whole seconds")
+        self.assertIsNone(reason)
+        self.assertEqual(usage, 22.2)  # 100 - 77.8 from the second sample
+
+    def test_top_failure_still_falls_back_to_ps_as_unverified(self):
+        with mock.patch.object(agentbox, "run_result", side_effect=[
+                ("", "top: boom"),
+                ("50.0\n50.0\n", None)]), \
+                mock.patch.object(agentbox.os, "cpu_count", return_value=2):
+            usage, reason, _ = agentbox._macos_cpu_usage()
+        self.assertEqual(usage, 50.0)
+        self.assertIn("fell back to ps", reason)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
