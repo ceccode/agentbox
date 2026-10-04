@@ -47,12 +47,19 @@ OPENCODE  (last 7d)   v1.18.18
 
 ## Install
 
-Python 3.10+, stdlib only.
+Python 3.10+, stdlib only. Pick one:
 
 ```bash
-git clone https://github.com/ceccode/agentbox && cd agentbox
-./install.sh          # symlinks to ~/bin/agentbox
+# single file, no clone
+mkdir -p ~/bin && curl -fsSL https://raw.githubusercontent.com/ceccode/agentbox/main/agentbox.py -o ~/bin/agentbox && chmod +x ~/bin/agentbox
 ```
+
+```bash
+# clone, symlink follows git pull
+git clone https://github.com/ceccode/agentbox && cd agentbox && ./install.sh
+```
+
+Make sure `~/bin` is on your PATH, then check with `agentbox --json | head`.
 
 ## Usage
 
@@ -70,156 +77,61 @@ agentbox --check            # exit 1 when warnings are present
 agentbox --deep disk        # inspect known AI storage directories
 agentbox claude             # Claude Code local usage, when available
 agentbox ollama             # installed and running Ollama models
-agentbox changes             # current repository state, without diff content
-agentbox usage               # token trend and configured daily budgets
-agentbox capacity            # deterministic readiness checks
-agentbox explain             # explanations and suggested actions for warnings
+agentbox changes            # current repository state, without diff content
+agentbox usage              # token trend and configured daily budgets
+agentbox capacity           # deterministic readiness checks
+agentbox explain            # explanations and suggested actions for warnings
 ```
 
-The JSON contract is versioned with the top-level `schema_version` field.
-Current value: `1`. This release keeps the existing fields and adds availability
-metadata, so the version remains unchanged. Consumers should read `status` and
-`warnings` before using section data, and should treat `available: false`,
-`availability: "partial"`, `unknown`, and `data_confidence: "unverified"` as
-non-healthy data states. `availability: "unsupported"` means the platform does
-not expose that feature; it is not automatically a machine-health warning.
-
-Every snapshot includes `platform.system` and capability flags. Availability
-states use one vocabulary:
-
-| State | Meaning |
-|---|---|
-| `available` | The measurement was read and has normal semantics. Zero can be a valid value. |
-| `unsupported` | The feature is not provided by this platform, such as Linux PSI on macOS. |
-| `unavailable` | The feature should be readable, but the source is missing, denied or malformed. |
-| `partial` | Some data was read, but records or subprocesses failed. Totals may be incomplete. |
-| `unverified` | The source is readable, but version or schema semantics are not verified. |
-
-`--no-titles` remains an alias for `--redact`. Use `--jsonl --watch 5` for a
-machine-readable stream; `--json --watch` is rejected because concatenated
-formatted JSON is not a valid stream.
-
-`--check` maps the same warning contract used by JSON to process exit codes:
-`0` means healthy, `1` means warnings (including `config_invalid`), and
-argparse errors use `2`.
-
-`capacity` lists the checks it ran and propagates blocked, contended and unknown
-resource checks into the same warning contract, so `agentbox --check capacity`
-is safe to use in CI or before starting another agent. It checks available RAM,
-CPU contention, disk free space, read-only filesystems, and Linux I/O PSI when
-applicable. It does not predict whether a specific model will fit or start.
-
-`--deep disk` scans known AI storage roots (`~/.ollama`, `~/.claude`, opencode,
-Hugging Face, llama.cpp and Docker) with bounded `du` scans. It is opt-in and
-does not follow other filesystems.
-
-Edit `WATCHED_UNITS` at the top of the file for your Linux machine. Optional
-configuration lives at `~/.config/agentbox/config.json`.
+Read `status` and `warnings` first; `--json` is the real interface and the
+text view is a pretty-printer over the same data. Section availability states
+(`available`, `unsupported`, `unavailable`, `partial`, `unverified`), exit
+codes, configuration and platform semantics are in
+[`docs/reference.md`](docs/reference.md).
 
 ## Give it to your agent
 
+The skill lives in [`skills/agentbox/SKILL.md`](skills/agentbox/SKILL.md).
+It teaches the agent you already use (Claude Code, opencode, Cursor, Codex and
+the other agents the `skills` CLI supports) to run `agentbox --json` instead of
+poking at `/proc`, `top` or provider databases by hand.
+
 ```bash
-./scripts/install-agent-skill.sh
+npx skills add ceccode/agentbox
 ```
 
-Symlinks `skills/agentbox/` into `~/.claude/skills/agentbox`. **opencode and
-Claude Code both read that path**, so one file serves both — nothing duplicated,
-nothing to keep in sync. Restart your agent and ask it how the box is doing;
-`/skills` lists it. Pass a project directory to scope it there instead.
+Add `-g` for a user-level install instead of the current project. The skill
+needs the `agentbox` binary on PATH (see Install); it only tells the agent how
+to call it.
 
-A skill, not an agent: agentbox isn't a persona to switch into, it's a tool the
-agent you're already talking to should know how to use — loaded on demand
-instead of sitting in context every turn. Details and the `AGENTS.md`
-alternative are in [`scripts/README.md`](scripts/README.md).
+Without Node, from a clone:
+
+```bash
+./scripts/install-agent-skill.sh          # ~/.claude/skills/agentbox, read by opencode and Claude Code
+./scripts/install-agent-skill.sh ~/proj   # project-scoped
+```
+
+Restart the agent and ask it how the box is doing. Prompts to try are in
+[`docs/test-prompts.md`](docs/test-prompts.md); why this is a skill and not an
+agent, and the `AGENTS.md` alternative, are in
+[`scripts/README.md`](scripts/README.md).
 
 No MCP server, no subagent, no daemon.
 
-## Notes
-
-- **Linux/macOS support.** Linux uses `/proc`, `/sys`, `systemctl`, `ss`,
-  `statvfs`, `nvidia-smi`/amdgpu sysfs and provider files. macOS uses `top`,
-  `ps`, `sysctl`, `vm_stat`, `statvfs`, `mount`, `lsof` and the same provider
-  files. Apple GPU, temperature sensors, launchd parity and Linux PSI on macOS
-  are explicitly unsupported for now.
-- **CPU semantics.** Linux CPU is sampled from `/proc/stat` over the measured
-  interval. macOS CPU is sampled from `top -l 2`; `sample_seconds` records the
-  actual elapsed sampling time.
-- **Memory semantics.** Linux reports `MemAvailable`. macOS reports
-  `available_bytes` as free + inactive + speculative pages from `vm_stat`; this
-  is not treated as Linux `MemAvailable`.
-- **opencode schema verified against 1.18.18.** The DB is read-only (`mode=ro`);
-  `AGENTBOX_OPENCODE_DB` overrides the path. Required tables and columns are
-  checked before querying; a different opencode version is reported as a
-  warning because semantic changes cannot be detected automatically.
-- Tokens are summed from `part` step-finish rows, not the `session.tokens_*`
-  columns (those hold the last turn only). Corrupt or duplicate records set
-  `partial` and diagnostic parse counters instead of being silently presented
-  as complete totals.
-- Local models report `cost: 0`, so the dollar figure only means something for
-  cloud providers. Use `ccusage` or `tokscale` for real spend accounting.
-- `--redact` strips host, network, process and session identifiers. Use it for
-  anything public or logged: `agentbox --jsonl --redact >> metrics.jsonl`.
-- PSI comes from `/proc/pressure`; disk metadata comes from mountinfo, statvfs
-  and diskstats. No elevated privileges or extra dependencies are required.
-- Claude Code usage is parsed locally from JSONL usage fields only; prompts,
-  tool output and project paths are never returned. Its local format is
-  best-effort and cost is deliberately not estimated.
-- `ollama` uses `ollama list` and `ollama ps`; `changes` reports only repository
-  metadata and numstat, never diff content.
-- `usage` compares today with the observed window and optional daily budgets.
-  `capacity` is deterministic and does not claim that a specific model will fit.
-  `explain` uses static explanations, never an embedded LLM.
-- Configuration is optional at `~/.config/agentbox/config.json`. Invalid values
-  produce `config_invalid` instead of silently disabling a threshold. Typos in
-  expected providers are rejected:
-
-  ```json
-  {
-    "disk_warning_pct": 85,
-    "inode_warning_pct": 85,
-    "usage": {
-      "opencode_daily_tokens": 500000,
-      "claude_daily_tokens": 300000
-    },
-    "expected_providers": ["opencode", "claude"],
-    "expected_services": ["ollama"]
-  }
-  ```
-
-Feature matrix:
-
-| Section | Linux | macOS |
-|---|---|---|
-| CPU/processes | `/proc/stat`, `/proc`, loadavg | `top`, `ps`, `sysctl`, loadavg |
-| Memory | `/proc/meminfo` | `vm_stat`, `sysctl` |
-| Disk | mountinfo, statvfs, diskstats | mount, statvfs |
-| Agents | executable names from `/proc` | executable names from `ps` |
-| Providers | opencode, Claude Code, Ollama | opencode, Claude Code, Ollama |
-| Services | systemd + `ss` listeners | systemd unsupported; listeners via `lsof` when present |
-| Pressure | Linux PSI | unsupported |
-| GPU | NVIDIA/AMD best effort | unsupported |
-
-## Tests
+## Development
 
 ```bash
 python3 -m unittest discover -s tests
 ```
 
-Prompt examples for testing the shared opencode and Claude Code skill are in
-[`docs/test-prompts.md`](docs/test-prompts.md).
+CI runs the same suite on Ubuntu and macOS with Python 3.10 and 3.13, then
+byte-compiles `agentbox.py`. Tests use fixtures only, so they do not depend
+on the host's `/proc`, providers or clock.
 
-Three kinds of drift are caught here rather than in the field:
-
-- The fixture DB is built from 1.18.18's exact schema in a temporary directory,
-  so an opencode schema move fails here instead of quietly reporting garbage.
-- `SKILL.md` promises an agent a specific set of flags and sections, and the
-  agent runs them without checking. `tests/test_docs.py` diffs that promise
-  against `build_parser()` in both directions, so renaming a flag — or adding
-  one and forgetting to document it — fails here instead of handing the agent
-  a command that exits non-zero for no visible reason.
-- Parser, accounting and availability tests use controlled fixtures so Linux
-  and macOS runs do not depend on the host's real `/home`, `/proc`, date, or
-  installed providers.
+`tests/test_docs.py` diffs `SKILL.md` against the argument parser in both
+directions: every flag and section the skill names must exist, and every flag
+and section the CLI accepts must be documented. Rename or add a flag and the
+build tells you which doc to update.
 
 ## License
 

@@ -2617,7 +2617,10 @@ def build_parser() -> argparse.ArgumentParser:
     the docs — SKILL.md promises agents a specific set of flags and sections,
     and a rename here would otherwise leave that promise silently false."""
     ap = argparse.ArgumentParser(
-        prog="agentbox", description="Status probe for a Linux AI agent box.")
+        prog="agentbox",
+        description="Status probe for a Linux or macOS AI agent box. "
+                    "Use --json for the machine-readable snapshot.",
+        epilog="Docs: https://github.com/ceccode/agentbox")
     ap.add_argument("section", nargs="?", default="status",
                     choices=sorted(SECTION_ALIASES))
     formats = ap.add_mutually_exclusive_group()

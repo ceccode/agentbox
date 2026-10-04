@@ -121,5 +121,12 @@ reason; do not try to query the DB yourself to work around it.
 
 ## Installing it elsewhere
 
-If `agentbox` is not on PATH: `git clone https://github.com/ceccode/agentbox &&
-cd agentbox && ./install.sh` (Python 3.10+, stdlib only, symlinks to `~/bin`).
+If `agentbox` is not on PATH, install the single file (Python 3.10+, stdlib
+only) and retry:
+
+```bash
+mkdir -p ~/bin && curl -fsSL https://raw.githubusercontent.com/ceccode/agentbox/main/agentbox.py -o ~/bin/agentbox && chmod +x ~/bin/agentbox
+```
+
+Or from a clone, so updates follow `git pull`:
+`git clone https://github.com/ceccode/agentbox && cd agentbox && ./install.sh`.

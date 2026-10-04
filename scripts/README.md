@@ -2,7 +2,18 @@
 
 ## Give agentbox to your agent
 
-Two steps, in order.
+The shortest path needs no clone of the skill at all:
+
+```bash
+npx skills add ceccode/agentbox        # add -g for user-level instead of project
+```
+
+The [`skills` CLI](https://github.com/vercel-labs/skills) reads
+`skills/agentbox/SKILL.md` from this repo and links it into every agent it
+detects (Claude Code, opencode, Cursor, Codex, ...). `npx skills update`
+refreshes it. The binary still has to be on PATH, so do step 1 below either way.
+
+The scripts here are the no-Node alternative. Two steps, in order.
 
 ### 1. Install the binary
 
@@ -78,3 +89,5 @@ constantly.
 rm ~/.claude/skills/agentbox        # or <project>/.claude/skills/agentbox
 rm ~/bin/agentbox
 ```
+
+If you installed with the `skills` CLI: `npx skills remove agentbox`.
