@@ -59,7 +59,15 @@ mkdir -p ~/bin && curl -fsSL https://raw.githubusercontent.com/ceccode/agentbox/
 git clone https://github.com/ceccode/agentbox && cd agentbox && ./install.sh
 ```
 
-Make sure `~/bin` is on your PATH, then check with `agentbox --json | head`.
+macOS and some Linux shells do not have `~/bin` on PATH. If `agentbox` is
+not found, add it once and reopen the shell (`install.sh` warns about this,
+the curl line does not):
+
+```bash
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc    # or ~/.bashrc
+```
+
+Check with `agentbox --json | head`.
 
 ## Usage
 

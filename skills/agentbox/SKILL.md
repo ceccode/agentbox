@@ -128,5 +128,9 @@ only) and retry:
 mkdir -p ~/bin && curl -fsSL https://raw.githubusercontent.com/ceccode/agentbox/main/agentbox.py -o ~/bin/agentbox && chmod +x ~/bin/agentbox
 ```
 
+If the command is still not found, `~/bin` is not on PATH (common on macOS).
+Run the binary as `~/bin/agentbox` for now and tell the user to add
+`export PATH="$HOME/bin:$PATH"` to their shell profile.
+
 Or from a clone, so updates follow `git pull`:
 `git clone https://github.com/ceccode/agentbox && cd agentbox && ./install.sh`.
