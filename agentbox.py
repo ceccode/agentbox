@@ -2341,12 +2341,18 @@ def render(snap: dict, width: int = 120, plain: bool = False) -> str:
                      f"{human_bytes(m['swap_used_bytes'])} / {human_bytes(m['swap_total_bytes'])}")
 
     if pressure := snap.get("pressure"):
-        values = []
-        for resource, level in (("cpu", "some"), ("memory", "full"), ("io", "full")):
-            avg10 = (pressure.get(resource) or {}).get(level, {}).get("avg10")
-            values.append(f"{resource} {level} {avg10:.1f}%" if avg10 is not None
-                          else f"{resource} unavailable")
-        L.append("PSI   " + "   ".join(values) + "  (avg10)")
+        if not pressure.get("available", True):
+            # Keep the text view on the same vocabulary as the JSON contract:
+            # "unsupported" is a platform limit, "unavailable" is a failed read.
+            state = pressure.get("availability") or AVAILABILITY_UNAVAILABLE
+            L.append(f"PSI   {state}: {pressure.get('reason') or 'no data'}")
+        else:
+            values = []
+            for resource, level in (("cpu", "some"), ("memory", "full"), ("io", "full")):
+                avg10 = (pressure.get(resource) or {}).get(level, {}).get("avg10")
+                values.append(f"{resource} {level} {avg10:.1f}%" if avg10 is not None
+                              else f"{resource} unavailable")
+            L.append("PSI   " + "   ".join(values) + "  (avg10)")
 
     g = snap.get("gpu")
     if g and not g.get("available", True):

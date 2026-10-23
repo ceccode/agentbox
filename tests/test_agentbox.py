@@ -932,5 +932,19 @@ class TestMacosCpuSampling(unittest.TestCase):
         self.assertIn("fell back to ps", reason)
 
 
+class TestPressureRendering(unittest.TestCase):
+    """The text view must use the same availability words as the JSON."""
+
+    def test_unsupported_pressure_is_not_rendered_as_unavailable(self):
+        snap = agentbox.snapshot(sections={"pressure"})
+        snap["pressure"] = agentbox.unavailable(
+            "pressure stall information is Linux-only", agentbox.AVAILABILITY_UNSUPPORTED)
+        text = agentbox.render(snap)
+        psi = next(line for line in text.splitlines() if line.startswith("PSI"))
+        self.assertIn("unsupported", psi)
+        self.assertIn("Linux-only", psi)
+        self.assertNotIn("unavailable", psi)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
